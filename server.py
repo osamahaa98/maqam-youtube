@@ -43,17 +43,37 @@ def selection(data):
         raise ValueError('اختر جزءًا بين ٣ و١٨٠ ثانية، داخل أول ٣٠ دقيقة.')
     return f'https://www.youtube.com/watch?v={vid}', start, end
 
+def failure_message(stderr):
+    text = stderr.decode('utf-8', errors='replace').lower()
+    if 'confirm you' in text and 'bot' in text:
+        return 'يوتيوب طلب التحقق من أن اتصال الخادم ليس آليًا؛ تعذّر الجلب من هذه الاستضافة.'
+    if 'no module named yt_dlp' in text:
+        return 'أداة جلب الصوت غير مثبتة على الخادم.'
+    if any(s in text for s in ('javascript runtime', 'javascript challenge', 'n challenge', 'signature extraction')):
+        return 'أداة الجلب لم تتمكن من معالجة تحقق يوتيوب؛ يلزم فحص إصدارها ومحرك JavaScript.'
+    if any(s in text for s in ('http error 403', '403 forbidden')):
+        return 'يوتيوب رفض طلب الصوت من الخادم (403).'
+    if any(s in text for s in ('private video', 'video unavailable', 'removed by', 'age-restricted', 'not available in your country')):
+        return 'الفيديو غير متاح للخادم أو يحتاج صلاحية وصول لا تدعمها الخدمة.'
+    if any(s in text for s in ('timed out', 'unable to download', 'name resolution', 'network is unreachable')):
+        return 'تعذّر اتصال أداة الجلب بيوتيوب؛ قد يكون عطلًا في الشبكة أو قيود وصول.'
+    if 'requested format is not available' in text:
+        return 'لم تتوفر صيغة صوت قابلة للجلب لهذا الفيديو.'
+    return 'فشلت أداة جلب الصوت؛ يلزم فحص سجل الخادم لمعرفة السبب.'
+
 def run(args, timeout=90):
     # Kill the whole process group (including ffmpeg) on timeout.
     p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
     try:
-        out, _ = p.communicate(timeout=timeout)
+        out, stderr = p.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         os.killpg(p.pid, signal.SIGKILL)
         p.communicate()
         raise ValueError('انتهت مهلة جلب الصوت؛ جرّب رفع الملف.')
     if p.returncode:
-        raise ValueError('تعذّر جلب هذا الفيديو. قد يكون مقيدًا أو غير متاح؛ جرّب رفع الملف.')
+        message = failure_message(stderr)
+        print('YouTube import failure: ' + message, file=sys.stderr, flush=True)
+        raise ValueError(message)
     return out
 
 def trim(source, target, start, end):
