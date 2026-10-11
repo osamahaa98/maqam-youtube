@@ -12,6 +12,8 @@ from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from time import monotonic
+from urllib.request import Request, build_opener, HTTPRedirectHandler
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlsplit
 
 ORIGIN = os.environ.get('SITE_ORIGIN', 'https://maqam-listener.soundtern.chatgpt.site')
@@ -90,23 +92,65 @@ def trim(source, target, start, end):
          '-ss', str(start), '-i', str(source), '-t', str(end-start), '-vn',
          '-ac', '1', '-ar', '22050', '-c:a', 'pcm_s16le', '-fs', str(LIMIT), str(target)], 30)
 
+class NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+PROVIDER = 'https://save.brianrianrehan.com'
+
+def provider_request(path, payload, target=None):
+    request = Request(PROVIDER + path, json.dumps(payload).encode(),
+                      {'Content-Type': 'application/json', 'Accept': '*/*', 'User-Agent': 'MaqamYouTube/1.0'}, method='POST')
+    try:
+        with build_opener(NoRedirect()).open(request, timeout=95 if target else 25) as response:
+            if response.status != 200:
+                raise ValueError('خدمة جلب الصوت لم تكمل الطلب؛ جرّب لاحقًا.')
+            cap = LIMIT if target else 1024 * 1024
+            length = response.headers.get('Content-Length')
+            if length and int(length) > cap:
+                raise ValueError('الصوت أكبر من الحد المتاح؛ ارفع الجزء المطلوب كملف.')
+            if target and not response.headers.get('Content-Type', '').startswith('audio/'):
+                raise ValueError('خدمة الجلب لم تُرجع ملف صوت صالحًا.')
+            total = 0
+            deadline = monotonic() + (100 if target else 25)
+            chunks = []
+            with open(target, 'wb') if target else tempfile.TemporaryFile() as output:
+                while True:
+                    if monotonic() > deadline:
+                        raise ValueError('انتهت مهلة خدمة جلب الصوت.')
+                    chunk = response.read(min(65536, cap - total + 1))
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > cap:
+                        raise ValueError('الملف تجاوز الحجم المتاح.')
+                    if target:
+                        output.write(chunk)
+                    else:
+                        chunks.append(chunk)
+            if not total:
+                raise ValueError('خدمة الجلب أرجعت ملفًا فارغًا.')
+            return None if target else json.loads(b''.join(chunks))
+    except HTTPError as error:
+        if error.code == 429:
+            raise ValueError('خدمة الجلب وصلت حد الطلبات؛ جرّب لاحقًا أو ارفع الملف.') from None
+        raise ValueError('خدمة جلب الصوت غير متاحة الآن؛ جرّب لاحقًا أو ارفع الملف.') from None
+    except (URLError, TimeoutError):
+        raise ValueError('تعذّر الاتصال بخدمة جلب الصوت؛ جرّب لاحقًا.') from None
+
 def import_audio(data):
     url, start, end = selection(data)
-    base = [sys.executable, '-m', 'yt_dlp', '--ignore-config', '--no-playlist',
-            '--verbose', '--socket-timeout', '15', '--retries', '1', '--js-runtimes', 'node']
-    meta = json.loads(run(base + ['--dump-single-json', '--skip-download', url], 45))
-    duration = meta.get('duration')
-    if meta.get('is_live') or not isinstance(duration, (float, int)) or not 3 <= duration <= 1800 or end > duration:
-        raise ValueError('اختر فيديو مسجلًا حتى ٣٠ دقيقة، وفترة داخل مدته.')
+    info = provider_request('/api/v1/info', {'url': url})
+    meta = info.get('data', {})
+    duration = meta.get('durationSeconds')
+    if not info.get('success') or meta.get('isLive') or not isinstance(duration, (float, int)) or not math.isfinite(duration) or not 3 <= duration <= 1800 or end > duration:
+        raise ValueError('اختر فيديو متاحًا ومسجلًا حتى ٣٠ دقيقة، وفترة داخل مدته.')
     with tempfile.TemporaryDirectory(prefix='maqam-youtube-') as folder:
-        root = Path(folder)
-        run(base + ['-f', 'bestaudio[filesize<40M]/bestaudio', '--max-filesize', str(LIMIT),
-                    '--no-progress', '-o', str(root / 'source.%(ext)s'), url])
-        files = [p for p in root.glob('source.*') if p.suffix not in ('.part', '.ytdl')]
-        if len(files) != 1 or not 0 < files[0].stat().st_size <= LIMIT:
-            raise ValueError('الصوت غير متاح أو أكبر من ٤٠ ميجابايت؛ ارفع الجزء المطلوب كملف.')
-        target = root / 'clip.wav'
-        trim(files[0], target, start, end)
+        source = Path(folder) / 'source.mp3'
+        provider_request('/api/v1/download?wait=true&download=true',
+                         {'url': url, 'format': 'audio', 'quality': 'best', 'outputFormat': 'mp3'}, source)
+        target = Path(folder) / 'clip.wav'
+        trim(source, target, start, end)
         return target.read_bytes()
 
 class Handler(BaseHTTPRequestHandler):
