@@ -77,8 +77,9 @@ def run(args, timeout=90):
         detail = re.sub(r'(?i)(authorization|cookie|token|password|secret)[^\n]*', '[REDACTED]', detail)
         detail = re.sub(r'/tmp/[^\s]+', '[TEMP_FILE]', detail)
         lines = [line.strip() for line in detail.splitlines() if line.strip()]
-        errors = [line for line in lines if 'error' in line.lower()]
-        detail = ' | '.join((errors or lines)[-3:])[:1000]
+        print('YouTube diagnostic log: ' + '\n'.join(lines)[-16000:], file=sys.stderr, flush=True)
+        relevant = [line for line in lines if any(term in line.lower() for term in ('warning', 'error', 'timed out', 'http error'))]
+        detail = ' | '.join((relevant or lines)[-8:])[-3000:]
         message += ' Details: ' + (detail or 'No stderr; exit=' + str(p.returncode))
         print('YouTube import failure: ' + message, file=sys.stderr, flush=True)
         raise ValueError(message)
@@ -92,7 +93,7 @@ def trim(source, target, start, end):
 def import_audio(data):
     url, start, end = selection(data)
     base = [sys.executable, '-m', 'yt_dlp', '--ignore-config', '--no-playlist',
-            '--no-warnings', '--socket-timeout', '15', '--retries', '1', '--js-runtimes', 'node']
+            '--verbose', '--socket-timeout', '15', '--retries', '1', '--js-runtimes', 'node']
     meta = json.loads(run(base + ['--dump-single-json', '--skip-download', url], 45))
     duration = meta.get('duration')
     if meta.get('is_live') or not isinstance(duration, (float, int)) or not 3 <= duration <= 1800 or end > duration:
