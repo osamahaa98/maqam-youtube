@@ -72,6 +72,14 @@ def run(args, timeout=90):
         raise ValueError('انتهت مهلة جلب الصوت؛ جرّب رفع الملف.')
     if p.returncode:
         message = failure_message(stderr)
+        detail = stderr.decode('utf-8', errors='replace')
+        detail = re.sub(r'https?://[^\s]+', '[URL]', detail)
+        detail = re.sub(r'(?i)(authorization|cookie|token|password|secret)[^\n]*', '[REDACTED]', detail)
+        detail = re.sub(r'/tmp/[^\s]+', '[TEMP_FILE]', detail)
+        lines = [line.strip() for line in detail.splitlines() if line.strip()]
+        errors = [line for line in lines if 'error' in line.lower()]
+        detail = ' | '.join((errors or lines)[-3:])[:1000]
+        message += ' Details: ' + (detail or 'No stderr; exit=' + str(p.returncode))
         print('YouTube import failure: ' + message, file=sys.stderr, flush=True)
         raise ValueError(message)
     return out
