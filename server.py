@@ -15,12 +15,15 @@ from time import monotonic
 from urllib.request import Request, build_opener, HTTPRedirectHandler
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlsplit
+from fast_audio import Service as DirectService
 
 ORIGIN = os.environ.get('SITE_ORIGIN', 'https://maqam-listener.soundtern.chatgpt.site')
 LIMIT = 40 * 1024 * 1024
 SLOTS = threading.BoundedSemaphore(2)
 RATE_LOCK = threading.Lock()
 RATE = {}
+DIRECT_ENABLED = os.environ.get('MAQAM_DIRECT_AUDIO') == '1'
+DIRECT_SERVICE = DirectService()
 
 def selection(data):
     u = urlsplit(str(data.get('url', '')))
@@ -154,7 +157,7 @@ def import_audio(data):
         return target.read_bytes()
 
 class Handler(BaseHTTPRequestHandler):
-    def reply(self, status, body, content_type='application/json; charset=utf-8'):
+    def reply(self, status, body, content_type='application/json; charset=utf-8', timings=None):
         self.send_response(status)
         self.send_header('Content-Type', content_type)
         self.send_header('Content-Length', str(len(body)))
@@ -162,6 +165,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('X-Content-Type-Options', 'nosniff')
         self.send_header('Access-Control-Allow-Origin', ORIGIN)
         self.send_header('Vary', 'Origin')
+        if timings is not None:
+            self.send_header('X-Maqam-Cache', timings['cache'])
+            self.send_header('X-Maqam-Source-Bytes', str(timings['sourceBytes']))
+            self.send_header('Server-Timing', ', '.join(k[:-2]+';dur='+str(v) for k,v in timings.items() if k.endswith('Ms')))
+            self.send_header('Access-Control-Expose-Headers', 'Server-Timing, X-Maqam-Cache, X-Maqam-Source-Bytes')
         self.end_headers()
         self.wfile.write(body)
 
@@ -179,14 +187,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == '/health':
-            return self.reply(200, b'{"ok":true}')
+            return self.reply(200, json.dumps({'ok':True,'directAudio':DIRECT_ENABLED}).encode())
         self.error(404, 'Not found')
 
     def do_POST(self):
-        if self.path != '/audio':
+        if self.path not in ('/audio', '/clip'):
             return self.error(404, 'Not found')
         if self.headers.get('Origin') != ORIGIN:
             return self.error(403, 'Origin denied')
+        if self.path == '/clip' and not DIRECT_ENABLED:
+            return self.error(503, 'المسار المباشر لم يُفعّل على هذا الخادم.')
         try:
             size = int(self.headers.get('Content-Length', '0'))
             if not 0 < size <= 4096:
@@ -206,13 +216,20 @@ class Handler(BaseHTTPRequestHandler):
             q = RATE.setdefault(self.client_address[0], deque())
             while q and now - q[0] > 600:
                 q.popleft()
-            if len(q) >= 6:
+            # Bounded native clips are much cheaper than whole-video provider jobs.
+            if len(q) >= (30 if self.path == '/clip' else 6):
                 return self.error(429, 'طلبات كثيرة؛ انتظر قليلًا أو ارفع الملف.')
             q.append(now)
         if not SLOTS.acquire(blocking=False):
             return self.error(503, 'الخدمة مشغولة؛ جرّب بعد قليل.')
         try:
-            self.reply(200, import_audio(data), 'audio/wav')
+            if self.path == '/clip':
+                url,start,end=selection(data)
+                video=parse_qs(urlsplit(url).query)['v'][0]
+                audio,timings=DIRECT_SERVICE.clip(video,start,end)
+                self.reply(200,audio,'audio/wav',timings)
+            else:
+                self.reply(200, import_audio(data), 'audio/wav')
         except ValueError as e:
             self.error(422, str(e))
         except Exception:
