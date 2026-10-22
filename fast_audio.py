@@ -228,6 +228,9 @@ class Resolver:
             elif any(term in detail for term in ('javascript challenge','signature extraction','n challenge')):reason='تعذّر معالجة تحقق JavaScript لاستخراج الصوت.'
             elif 'requested format is not available' in detail:reason='صيغة AAC المباشرة غير متاحة لهذا الفيديو.'
             print('Direct resolver: '+reason,file=sys.stderr,flush=True)
+            diagnostic=re.sub(r'https?://[^\s]+','[URL]',stderr.decode('utf-8',errors='replace'))
+            diagnostic=re.sub(r'(?i)(authorization|cookie|token|password|secret)[^\n]*','[REDACTED]',diagnostic)
+            print('Direct resolver diagnostic: '+diagnostic[-6000:],file=sys.stderr,flush=True)
             raise FastAudioError(reason)
         if len(out)>4*1024*1024:raise FastAudioError('بيانات مصدر كبيرة.')
         try:
