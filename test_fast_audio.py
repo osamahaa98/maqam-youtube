@@ -15,7 +15,7 @@ import wave
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
-from fast_audio import M4A,Remote,Service,FastAudioError,media_url,CHUNK
+from fast_audio import M4A,Remote,Service,FastAudioError,media_url,CHUNK,TunelioResolver,configured_resolver,Resolver
 
 class FileSource:
     def __init__(self,data):self.data=data;self.length=len(data);self.bytes=0;self.reads=[]
@@ -50,10 +50,10 @@ class Tests(unittest.TestCase):
         for url in ('http://x.googlevideo.com/audio','https://googlevideo.com.evil.test/audio','https://u:p@x.googlevideo.com/audio','https://x.googlevideo.com:444/audio','https://localhost/audio'):
             with self.assertRaises(FastAudioError):media_url(url)
     def test_real_http_bounded_parallel_ranges_and_ignored_range_rejection(self):
-        data=self.data;requests=[]
+        data=self.data;requests=[];auth=[]
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):
-                request=self.headers.get('Range','');requests.append(request);a,b=map(int,re.fullmatch(r'bytes=(\d+)-(\d+)',request).groups());body=data[a:b+1]
+                request=self.headers.get('Range','');requests.append(request);auth.append(self.headers.get('Authorization'));a,b=map(int,re.fullmatch(r'bytes=(\d+)-(\d+)',request).groups());body=data[a:b+1]
                 if self.path=='/ignored':self.send_response(200)
                 else:self.send_response(206)
                 self.send_header('Content-Range',f'bytes {a}-{b}/{len(data)}');self.send_header('Content-Length',str(len(body)));self.end_headers()
@@ -65,8 +65,10 @@ class Tests(unittest.TestCase):
             path='/audio'
             def open(self,request,timeout):return urllib.request.urlopen(urllib.request.Request(f'http://127.0.0.1:{server.server_port}'+self.path,headers=dict(request.header_items())),timeout=timeout)
         try:
-            source=Remote('https://test.googlevideo.com/audio',len(data));source.opener=Opener();n=CHUNK*2+100
-            self.assertEqual(source.read(7,n),data[7:7+n]);self.assertEqual(source.bytes,n);self.assertEqual(len(requests),3)
+            for url in ('https://test.googlevideo.com/audio','https://tunelio.dev/tunnel?sig=test'):
+                requests.clear();auth.clear()
+                source=Remote(url,len(data),{'Authorization':'Bearer tnl_test_only'});source.opener=Opener();n=CHUNK*2+100
+                self.assertEqual(source.read(7,n),data[7:7+n]);self.assertEqual(source.bytes,n);self.assertEqual(len(requests),3);self.assertEqual(auth,[None]*3)
             source.opener.path='/ignored'
             with self.assertRaises(FastAudioError):source.read(0,20)
         finally:server.shutdown();server.server_close();thread.join()
@@ -96,4 +98,64 @@ class Tests(unittest.TestCase):
             with patch('server.DIRECT_ENABLED',True),patch('server.DIRECT_SERVICE.clip',return_value=(b'RIFF-test',{'cache':'miss','sourceBytes':123,'totalMs':10})):
                 with urllib.request.urlopen(req) as r:self.assertEqual(r.read(),b'RIFF-test');self.assertEqual(r.headers['X-Maqam-Source-Bytes'],'123');self.assertIn('total;dur=10',r.headers['Server-Timing'])
         finally:server.shutdown();server.server_close();t.join()
+class TunelioTests(unittest.TestCase):
+    def resolver(self,change=None,body=None):
+        data={'status':'ok','quality':'m4a','mode':'audio','file_size':123456,'expires':int(time.time())+3600,'url':'https://tunelio.dev/tunnel?exp=123&sig=test'}
+        data.update(change or {})
+        raw=body if body is not None else json.dumps(data).encode()
+        class Response(io.BytesIO):status=200
+        class Opener:
+            calls=[]
+            def open(self,request,timeout):
+                self.calls.append((request,timeout));return Response(raw)
+        r=TunelioResolver('tnl_test_only');r.opener=Opener();r.opener.calls=[]
+        return r
+    def test_one_m4a_resolution_concurrent_cache_and_secret_scope(self):
+        r=self.resolver()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            results=list(pool.map(lambda _:r.resolve('abcdefghijk'),range(2)))
+        self.assertEqual(len(r.opener.calls),1)
+        req,timeout=r.opener.calls[0]
+        query=urllib.parse.parse_qs(urllib.parse.urlsplit(req.full_url).query)
+        self.assertEqual(query['quality'],['m4a']);self.assertEqual(timeout,8)
+        self.assertEqual(req.get_header('Authorization'),'Bearer tnl_test_only')
+        self.assertNotIn('tnl_test_only',req.full_url)
+        self.assertCountEqual([hit for _,hit in results],[False,True])
+        self.assertEqual(results[0][0]['headers'],{})
+        self.assertNotIn('tnl_test_only',json.dumps(results))
+    def test_tunnel_allowlist_rejects_credentials_redirect_hosts_and_nonmedia_paths(self):
+        self.assertTrue(media_url('https://tunelio.dev/tunnel?sig=example'))
+        for url in ('https://tunelio.dev.evil.test/tunnel?sig=x','http://tunelio.dev/tunnel?sig=x','https://user:pass@tunelio.dev/tunnel?sig=x','https://tunelio.dev/create?url=x','https://tunelio.dev/tunnel','https://tunelio.dev:444/tunnel?sig=x','https://tunelio.dev/tunnel?sig=x#fragment',None):
+            with self.subTest(url=url),self.assertRaises(FastAudioError):media_url(url)
+    def test_reject_bad_contract_or_missing_key_without_fallback(self):
+        for change in ({'quality':'mp3'},{'mode':'video'},{'status':'failed'},{'expires':1},{'file_size':True},{'file_size':50*1024*1024},{'url':'https://evil.test/tunnel?sig=x'},{'url':'https://x.googlevideo.com/audio'}):
+            r=self.resolver(change)
+            with self.subTest(change=change),self.assertRaises(FastAudioError):r.resolve('abcdefghijk')
+        for raw in (b'[]',b'not-json',b' '*65537):
+            with self.subTest(raw=raw[:10]),self.assertRaises(FastAudioError):self.resolver(body=raw).resolve('abcdefghijk')
+        for key in ('','key\r\nInjected: value'):
+            r=self.resolver();r.key=key
+            with self.assertRaises(FastAudioError):r.resolve('abcdefghijk')
+            self.assertEqual(len(r.opener.calls),0)
+    def test_http_errors_never_expose_vendor_body_credentials_or_signed_urls(self):
+        for status in (401,402,404,429,500):
+            r=self.resolver()
+            with patch.object(r.opener,'open',side_effect=urllib.error.HTTPError('https://tunelio.dev/create',status,'secret-detail',{},io.BytesIO(b'tnl_test_only'))):
+                with self.assertRaises(FastAudioError) as caught:r.resolve('abcdefghijk')
+            self.assertNotIn('tnl_test_only',str(caught.exception));self.assertNotIn('secret-detail',str(caught.exception))
+            self.assertEqual(len(r.cache),0)
+    def test_short_link_expiry_controls_cache_ttl(self):
+        r=self.resolver({'expires':int(time.time())+60})
+        r.resolve('abcdefghijk')
+        self.assertLessEqual(r.cache['abcdefghijk'][0]-time.monotonic(),30)
+        with patch('fast_audio.time.monotonic',return_value=time.monotonic()+31):r.resolve('abcdefghijk')
+        self.assertEqual(len(r.opener.calls),2)
+    def test_explicit_provider_configuration(self):
+        with patch.dict('os.environ',{'MAQAM_AUDIO_RESOLVER':'tunelio','TUNELIO_API_KEY':'tnl_test_only'}):
+            self.assertIsInstance(configured_resolver(),TunelioResolver)
+            self.assertIsInstance(Service().resolver,TunelioResolver)
+        with patch.dict('os.environ',{'MAQAM_AUDIO_RESOLVER':'yt-dlp'}):self.assertIsInstance(configured_resolver(),Resolver)
+        with patch.dict('os.environ',{'MAQAM_AUDIO_RESOLVER':'unknown'}):
+            with self.assertRaises(FastAudioError):configured_resolver()
+
 if __name__=='__main__':unittest.main()

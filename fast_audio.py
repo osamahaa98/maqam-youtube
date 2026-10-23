@@ -1,5 +1,5 @@
 """Opt-in native AAC range path. Never falls back to a whole-video conversion queue.
-Only the resolver talks to YouTube metadata; only signed Googlevideo URLs are read.
+Only the resolver talks to metadata; signed Googlevideo or Tunelio tunnel URLs are read.
 Signed URLs remain in bounded process memory and are never returned to the browser.
 """
 import bisect
@@ -19,8 +19,9 @@ import time
 import wave
 from collections import OrderedDict
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlencode
 from urllib.request import Request, build_opener, HTTPRedirectHandler
+from urllib.error import HTTPError, URLError
 
 MAX_METADATA=4*1024*1024
 MAX_SOURCE=40*1024*1024
@@ -34,8 +35,11 @@ class NoRedirect(HTTPRedirectHandler):
     def redirect_request(self,*_):return None
 
 def media_url(url):
-    u=urlsplit(url)
-    if u.scheme!='https' or u.username or u.password or u.port not in (None,443) or not u.hostname or not u.hostname.endswith('.googlevideo.com'):
+    if not isinstance(url,str):raise FastAudioError('مصدر الصوت المباشر غير مدعوم.')
+    try:u=urlsplit(url);port=u.port
+    except ValueError:raise FastAudioError('مصدر الصوت المباشر غير مدعوم.') from None
+    allowed=u.hostname and (u.hostname.endswith('.googlevideo.com') or (u.hostname=='tunelio.dev' and u.path=='/tunnel' and bool(u.query)))
+    if u.scheme!='https' or u.username or u.password or port not in (None,443) or not allowed or u.fragment or len(url)>8192:
         raise FastAudioError('مصدر الصوت المباشر غير مدعوم.')
     return url
 
@@ -214,6 +218,14 @@ class Resolver:
         with self.lock:
             item=self.cache.get(video)
             if item and item[0]>time.monotonic():self.cache.move_to_end(video);return item[1],True
+        result=self._uncached(video)
+        ttl=min(300,result.get('expires',time.time()+330)-time.time()-30)
+        if ttl<=0:raise FastAudioError('انتهت صلاحية مصدر الصوت.')
+        with self.lock:
+            self.cache[video]=(time.monotonic()+ttl,result)
+            while len(self.cache)>64:self.cache.popitem(last=False)
+        return result,False
+    def _uncached(self,video):
         args=[sys.executable,'-m','yt_dlp','--no-playlist','--skip-download','--extractor-args','youtube:player_client=web;player_skip=initial_data','--dump-single-json','--socket-timeout','5','--retries','0','--extractor-retries','0','--js-runtimes','node','-f','bestaudio[ext=m4a][acodec=mp4a.40.2][protocol=https]','--','https://www.youtube.com/watch?v='+video]
         p=subprocess.Popen(args,stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True)
         try:out,stderr=p.communicate(timeout=15)
@@ -238,13 +250,45 @@ class Resolver:
             if j.get('id')!=video or j.get('is_live') or not isinstance(duration,(int,float)) or not math.isfinite(duration) or not 3<=duration<=1800 or not isinstance(size,int) or not 0<size<=MAX_SOURCE:raise ValueError()
             result={'url':url,'length':size,'duration':duration,'headers':j.get('http_headers',{})}
         except (KeyError,TypeError,ValueError):raise FastAudioError('بيانات مصدر غير مدعومة.') from None
-        with self.lock:
-            self.cache[video]=(time.monotonic()+300,result)
-            while len(self.cache)>64:self.cache.popitem(last=False)
-        return result,False
+        return result
+
+class TunelioResolver(Resolver):
+    """One paid/trial resolution, then bounded native AAC reads. No conversion jobs.
+    The API credential is used only on /create; never on media requests or in logs.
+    """
+    def __init__(self,key=None):
+        super().__init__();self.key=key if key is not None else os.environ.get('TUNELIO_API_KEY','')
+        self.opener=build_opener(NoRedirect())
+    def _uncached(self,video):
+        if not self.key or len(self.key)>512 or not self.key.isascii() or any(ord(c)<=32 or ord(c)==127 for c in self.key):raise FastAudioError('مفتاح خدمة الصوت المباشر غير مضبوط على الخادم.')
+        query=urlencode({'url':'https://www.youtube.com/watch?v='+video,'quality':'m4a'})
+        request=Request('https://tunelio.dev/create?'+query,headers={'Authorization':'Bearer '+self.key,'Accept':'application/json','User-Agent':'MaqamYouTube/1.0'})
+        try:
+            with self.opener.open(request,timeout=8) as response:
+                if response.status!=200:raise FastAudioError('خدمة الصوت المباشر لم تكمل الطلب.')
+                raw=response.read(65537)
+        except HTTPError as error:
+            messages={401:'مفتاح خدمة الصوت المباشر غير مقبول.',402:'انتهى رصيد خدمة الصوت المباشر.',404:'الفيديو غير متاح لخدمة الصوت.',429:'خدمة الصوت وصلت حد الطلبات؛ جرّب لاحقًا.'}
+            raise FastAudioError(messages.get(error.code,'خدمة الصوت المباشر غير متاحة الآن.')) from None
+        except (URLError,TimeoutError):raise FastAudioError('انتهت مهلة اتصال خدمة الصوت المباشر.') from None
+        try:
+            if len(raw)>65536:raise ValueError()
+            data=json.loads(raw)
+            if not isinstance(data,dict):raise ValueError()
+            size=data['file_size'];expires=data['expires'];url=media_url(data['url'])
+            if data.get('status')!='ok' or data.get('quality')!='m4a' or data.get('mode')!='audio' or type(size) is not int or not 0<size<=MAX_SOURCE or type(expires) is not int or expires<=time.time()+30:raise ValueError()
+            if urlsplit(url).hostname!='tunelio.dev':raise ValueError()
+        except (ValueError,TypeError,KeyError):raise FastAudioError('بيانات خدمة الصوت المباشر غير صالحة.') from None
+        return {'url':url,'length':size,'headers':{},'expires':expires}
+
+def configured_resolver():
+    name=os.environ.get('MAQAM_AUDIO_RESOLVER','yt-dlp')
+    if name=='tunelio':return TunelioResolver()
+    if name=='yt-dlp':return Resolver()
+    raise FastAudioError('إعداد مزوّد الصوت غير مدعوم.')
 
 class Service:
-    def __init__(self):self.resolver=Resolver();self.lock=threading.Lock();self.cache=OrderedDict();self.bytes=0;self.jobs=[threading.Lock() for _ in range(16)]
+    def __init__(self,resolver=None):self.resolver=resolver if resolver is not None else configured_resolver();self.lock=threading.Lock();self.cache=OrderedDict();self.bytes=0;self.jobs=[threading.Lock() for _ in range(16)]
     def clip(self,video,start,end):
         queued=time.monotonic()
         with self.jobs[hash((video,start,end))%len(self.jobs)]:
@@ -258,6 +302,7 @@ class Service:
             saved=self.cache.get(key)
             if saved and saved[0]>started:self.cache.move_to_end(key);return saved[1],{'cache':'hit','totalMs':round((time.monotonic()-started)*1000),'sourceBytes':0}
         meta,resolver_hit=self.resolver.resolve(video);resolved=time.monotonic();remote=Remote(meta['url'],meta['length'],meta['headers']);index=M4A(remote)
+        if not 3<=index.duration<=1800:raise FastAudioError('اختر فيديو مسجلًا حتى ٣٠ دقيقة.')
         with tempfile.TemporaryDirectory(prefix='maqam-fast-') as folder:
             source=Path(folder)/'clip.aac';target=Path(folder)/'clip.wav';offset,duration=index.cut(start,end,source);fetched=time.monotonic()
             args=['ffmpeg','-nostdin','-v','error','-protocol_whitelist','file,pipe','-ss',str(offset),'-i',str(source),'-t',str(duration),'-vn','-ac','1','-ar','22050','-c:a','pcm_s16le',str(target)]
