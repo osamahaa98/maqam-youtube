@@ -55,7 +55,9 @@ class Tests(unittest.TestCase):
         source=FileSource(self.fragmented.read_bytes());m=M4A(source)
         self.assertTrue(m.fragmented);self.assertAlmostEqual(m.duration,600,delta=.06)
         target=self.folder/'fragment-cut.aac';offset,duration=m.cut(589.125,592.625,target)
-        command=['ffmpeg','-v','error','-ss',str(offset),'-i',str(target),'-t',str(duration),'-ar','44100','-ac','1','-f','f32le','-']
+        remux=self.folder/'fractional.m4a'
+        subprocess.run(['ffmpeg','-v','error','-ss',str(offset),'-i',str(target),'-t',str(duration),'-c:a','copy','-movflags','+faststart',str(remux)],check=True)
+        command=['ffmpeg','-v','error','-ss','0','-i',str(remux),'-t',str(duration),'-ar','44100','-ac','1','-f','f32le','-']
         pcm=subprocess.check_output(command,timeout=8)
         ref=subprocess.check_output(['ffmpeg','-v','error','-ss','589.125','-i',str(self.fragmented),'-t','3.5','-ar','44100','-ac','1','-f','f32le','-'],timeout=8)
         self.assertAlmostEqual(len(pcm)/4/44100,3.5,delta=.04)
@@ -120,8 +122,11 @@ class Tests(unittest.TestCase):
                 results=list(pool.map(lambda _:service.clip('abcdefghijk',589,592),range(2)))
             self.assertEqual(service.resolver.calls,1);self.assertEqual(len(sources),1)
             self.assertCountEqual([r[1]['cache'] for r in results],['miss','hit']);self.assertEqual(results[0][0],results[1][0])
-            with wave.open(io.BytesIO(results[0][0])) as w:self.assertEqual(w.getframerate(),22050);self.assertEqual(w.getnchannels(),1);self.assertAlmostEqual(w.getnframes()/22050,3,delta=.04)
-            print('Local clip service pair (including AAC decode): %.3fs; cache hit reads0source bytes.'%(time.monotonic()-started),flush=True)
+            self.assertEqual(results[0][1]['contentType'],'audio/mp4');self.assertEqual(results[1][1]['clipSeconds'],3)
+            file=self.folder/'service.m4a';file.write_bytes(results[0][0])
+            pcm=subprocess.check_output(['ffmpeg','-v','error','-i',str(file),'-t','3','-ar','22050','-ac','1','-f','s16le','-'])
+            self.assertAlmostEqual(len(pcm)/2/22050,3,delta=.04)
+            print('Local clip service pair (AAC remux, no re-encoding): %.3fs; cache hit reads0source bytes.'%(time.monotonic()-started),flush=True)
     def test_http_opt_in_and_timings(self):
         import server as module
         server=ThreadingHTTPServer(('127.0.0.1',0),module.Handler);t=threading.Thread(target=server.serve_forever,daemon=True);t.start()

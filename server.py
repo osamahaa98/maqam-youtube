@@ -229,7 +229,7 @@ class Handler(BaseHTTPRequestHandler):
                 url,start,end=selection(data)
                 video=parse_qs(urlsplit(url).query)['v'][0]
                 audio,timings=DIRECT_SERVICE.clip(video,start,end)
-                self.reply(200,audio,'audio/wav',timings)
+                self.reply(200,audio,timings.get('contentType','audio/wav'),timings)
             else:
                 self.reply(200, import_audio(data), 'audio/wav')
         except ValueError as e:

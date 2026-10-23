@@ -26,7 +26,7 @@ from urllib.error import HTTPError, URLError
 MAX_METADATA=4*1024*1024
 MAX_SOURCE=40*1024*1024
 MAX_TRANSFER=12*1024*1024
-CHUNK=256*1024
+CHUNK=1024*1024
 PREFIX=64*1024
 RATES=[96000,88200,64000,48000,44100,32000,24000,22050,16000,12000,11025,8000,7350]
 
@@ -79,7 +79,7 @@ class Remote:
             headers={k:v for k,v in self.headers.items() if k.lower() in ('user-agent','accept','accept-language')}
             headers['Range']=f'bytes={pos}-{pos+count-1}'
             try:
-                with self.opener.open(Request(self.url,headers=headers),timeout=min(8,max(.1,self.deadline-time.monotonic()))) as r:
+                with self.opener.open(Request(self.url,headers=headers),timeout=min(12,max(.1,self.deadline-time.monotonic()))) as r:
                     expected=f'bytes {pos}-{pos+count-1}/{self.length}'
                     if r.status!=206 or r.headers.get('Content-Range')!=expected:raise FastAudioError('المصدر لم يحترم نطاق الصوت؛ أوقفنا الطلب.')
                     data=r.read(count+1)
@@ -347,7 +347,7 @@ class M4A:
             i=first
             while i<last:
                 j=i+1;size=self.sizes[i]
-                while j<last and self.offsets[j]==self.offsets[j-1]+self.sizes[j-1] and size+self.sizes[j]<=8*CHUNK:
+                while j<last and self.offsets[j]==self.offsets[j-1]+self.sizes[j-1] and size+self.sizes[j]<=min(8*CHUNK,MAX_METADATA):
                     size+=self.sizes[j];j+=1
                 data=self.source.read(self.offsets[i],size);p=0
                 for k in range(i,j):
@@ -450,18 +450,20 @@ class Service:
         key=(video,start,end);started=time.monotonic()
         with self.lock:
             saved=self.cache.get(key)
-            if saved and saved[0]>started:self.cache.move_to_end(key);return saved[1],{'cache':'hit','totalMs':round((time.monotonic()-started)*1000),'sourceBytes':0,'clipSeconds':saved[2]}
+            if saved and saved[0]>started:self.cache.move_to_end(key);return saved[1],{'cache':'hit','totalMs':round((time.monotonic()-started)*1000),'sourceBytes':0,'clipSeconds':saved[2],'contentType':'audio/mp4'}
         meta,resolver_hit=self.resolver.resolve(video);resolved=time.monotonic();remote=Remote(meta['url'],meta['length'],meta['headers']);index=M4A(remote)
         if not 3<=index.duration<=1800:raise FastAudioError('اختر فيديو مسجلًا حتى ٣٠ دقيقة.')
         with tempfile.TemporaryDirectory(prefix='maqam-fast-') as folder:
-            source=Path(folder)/'clip.aac';target=Path(folder)/'clip.wav';offset,duration=index.cut(start,end,source);fetched=time.monotonic()
-            args=['ffmpeg','-nostdin','-v','error','-protocol_whitelist','file,pipe','-ss',str(offset),'-i',str(source),'-t',str(duration),'-vn','-ac','1','-ar','22050','-c:a','pcm_s16le',str(target)]
+            source=Path(folder)/'clip.aac';target=Path(folder)/'clip.m4a';offset,duration=index.cut(start,end,source);fetched=time.monotonic()
+            args=['ffmpeg','-nostdin','-v','error','-protocol_whitelist','file,pipe','-ss',str(offset),'-i',str(source),'-t',str(duration),'-vn','-c:a','copy','-movflags','+faststart',str(target)]
             try:p=subprocess.run(args,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=8)
-            except subprocess.TimeoutExpired:raise FastAudioError('انتهت مهلة فك الفترة الصوتية.') from None
-            if p.returncode or not target.is_file():raise FastAudioError('تعذّر فك الفترة الصوتية.')
+            except subprocess.TimeoutExpired:raise FastAudioError('انتهت مهلة تجهيز الفترة الصوتية.') from None
+            if p.returncode or not target.is_file():raise FastAudioError('تعذّر تجهيز الفترة الصوتية.')
             body=target.read_bytes()
-            with wave.open(io.BytesIO(body)) as w:
-                if abs(w.getnframes()/w.getframerate()-duration)>.08:raise FastAudioError('الفترة الصوتية غير مكتملة.')
+            class Memory:
+                length=len(body)
+                def read(self,offset,size):return body[offset:offset+size]
+            if abs(M4A(Memory()).duration-duration)>.08:raise FastAudioError('الفترة الصوتية غير مكتملة.')
         with self.lock:
             now=time.monotonic()
             for k in list(self.cache):
@@ -469,4 +471,4 @@ class Service:
             while self.cache and (self.bytes+len(body)>32*1024*1024 or len(self.cache)>=32):self.bytes-=len(self.cache.popitem(last=False)[1][1])
             if key in self.cache:self.bytes-=len(self.cache.pop(key)[1])
             self.cache[key]=(now+600,body,duration);self.bytes+=len(body)
-        return body,{'cache':'miss','resolverCache':resolver_hit,'resolveMs':round((resolved-started)*1000),'rangeMs':round((fetched-resolved)*1000),'decodeMs':round((time.monotonic()-fetched)*1000),'totalMs':round((time.monotonic()-started)*1000),'sourceBytes':remote.bytes,'clipSeconds':duration}
+        return body,{'cache':'miss','resolverCache':resolver_hit,'resolveMs':round((resolved-started)*1000),'rangeMs':round((fetched-resolved)*1000),'muxMs':round((time.monotonic()-fetched)*1000),'totalMs':round((time.monotonic()-started)*1000),'sourceBytes':remote.bytes,'clipSeconds':duration,'contentType':'audio/mp4'}

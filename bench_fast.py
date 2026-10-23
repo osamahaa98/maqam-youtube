@@ -16,7 +16,7 @@ def main():
             body,timings=service.clip(video,start,start+args.seconds)
             cold=time.monotonic()-begin
             begin=time.monotonic();_,warm=service.clip(video,start,start+args.seconds)
-            result={'video_id':video,'ok':True,'cold_seconds':cold,'repeat_seconds':time.monotonic()-begin,'wav_bytes':len(body),'cold':timings,'repeat':warm}
+            result={'video_id':video,'ok':True,'cold_seconds':cold,'repeat_seconds':time.monotonic()-begin,'audio_bytes':len(body),'cold':timings,'repeat':warm}
         except Exception as e:result={'video_id':video,'ok':False,'elapsed_seconds':time.monotonic()-begin,'error':str(e)[:300]}
         results.append(result);print(json.dumps(result,ensure_ascii=False),flush=True)
     times=[r['cold_seconds'] for r in results if r['ok']]
