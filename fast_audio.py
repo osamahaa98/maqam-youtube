@@ -214,7 +214,7 @@ class Resolver:
         with self.lock:
             item=self.cache.get(video)
             if item and item[0]>time.monotonic():self.cache.move_to_end(video);return item[1],True
-        args=[sys.executable,'-m','yt_dlp','--no-playlist','--no-warnings','--skip-download','--dump-single-json','--socket-timeout','5','--retries','0','--extractor-retries','0','--js-runtimes','node','-f','bestaudio[ext=m4a][acodec=mp4a.40.2][protocol=https]','--','https://www.youtube.com/watch?v='+video]
+        args=[sys.executable,'-m','yt_dlp','--no-playlist','--skip-download','--extractor-args','youtube:player_client=web;player_skip=initial_data','--dump-single-json','--socket-timeout','5','--retries','0','--extractor-retries','0','--js-runtimes','node','-f','bestaudio[ext=m4a][acodec=mp4a.40.2][protocol=https]','--','https://www.youtube.com/watch?v='+video]
         p=subprocess.Popen(args,stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True)
         try:out,stderr=p.communicate(timeout=15)
         except subprocess.TimeoutExpired:
