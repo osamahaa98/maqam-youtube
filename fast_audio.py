@@ -34,6 +34,14 @@ class FastAudioError(ValueError):pass
 class NoRedirect(HTTPRedirectHandler):
     def redirect_request(self,*_):return None
 
+def failure_markers(error):
+    # Classify a bounded vendor error without logging its text or signed URL.
+    try:text=error.read(4096).decode('utf-8',errors='ignore').lower()
+    except Exception:return 'unreadable'
+    finally:error.close()
+    terms=('cloudflare','invalid signature','expired','upstream','youtube','unauthorized','forbidden','access denied')
+    return ','.join(term.replace(' ','_') for term in terms if term in text) or 'unclassified'
+
 def media_url(url):
     if not isinstance(url,str):raise FastAudioError('مصدر الصوت المباشر غير مدعوم.')
     try:u=urlsplit(url);port=u.port
@@ -66,7 +74,7 @@ class Remote:
                     with self.transfer_lock:self.bytes+=len(data)
                     return data
             except HTTPError as error:
-                print('Audio range HTTP status='+str(error.code),file=sys.stderr,flush=True)
+                print('Audio range HTTP status='+str(error.code)+' markers='+failure_markers(error),file=sys.stderr,flush=True)
                 raise FastAudioError('مصدر الصوت رفض جلب الفترة ('+str(error.code)+').') from None
             except (URLError,TimeoutError) as error:
                 print('Audio range network failure type='+type(error).__name__,file=sys.stderr,flush=True)
@@ -288,7 +296,7 @@ class TunelioResolver(Resolver):
             if urlsplit(url).hostname!='tunelio.dev':raise ValueError()
         except (ValueError,TypeError,KeyError):raise FastAudioError('بيانات خدمة الصوت المباشر غير صالحة.') from None
         print('Tunelio create validated: native AAC source ready',file=sys.stderr,flush=True)
-        return {'url':url,'length':size,'headers':{},'expires':expires}
+        return {'url':url,'length':size,'headers':{'User-Agent':'MaqamYouTube/1.0','Accept':'*/*'},'expires':expires}
 
 def configured_resolver():
     name=os.environ.get('MAQAM_AUDIO_RESOLVER','yt-dlp')

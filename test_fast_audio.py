@@ -130,7 +130,7 @@ class TunelioTests(unittest.TestCase):
         self.assertEqual(req.get_header('Authorization'),'Bearer tnl_test_only')
         self.assertNotIn('tnl_test_only',req.full_url)
         self.assertCountEqual([hit for _,hit in results],[False,True])
-        self.assertEqual(results[0][0]['headers'],{})
+        self.assertEqual(results[0][0]['headers'],{'User-Agent':'MaqamYouTube/1.0','Accept':'*/*'})
         self.assertNotIn('tnl_test_only',json.dumps(results))
     def test_tunnel_allowlist_rejects_credentials_redirect_hosts_and_nonmedia_paths(self):
         self.assertTrue(media_url('https://tunelio.dev/tunnel?sig=example'))
