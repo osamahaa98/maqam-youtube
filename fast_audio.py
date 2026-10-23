@@ -26,7 +26,7 @@ from urllib.error import HTTPError, URLError
 MAX_METADATA=4*1024*1024
 MAX_SOURCE=40*1024*1024
 MAX_TRANSFER=12*1024*1024
-CHUNK=128*1024
+CHUNK=256*1024
 PREFIX=64*1024
 RATES=[96000,88200,64000,48000,44100,32000,24000,22050,16000,12000,11025,8000,7350]
 
@@ -267,8 +267,9 @@ class M4A:
                 return
             pos+=size
         raise FastAudioError('الصوت المجزأ يحتاج فهرسًا مباشرًا للفترات.')
-    def _fragment_samples(self,entry):
-        offset,length,_,_=entry;data=self.source.read(offset,length)
+    def _fragment_samples(self,entry,data=None):
+        offset,length,_,_=entry
+        if data is None:data=self.source.read(offset,length)
         records=list(located_boxes(data));media=[(p+h,p+h+len(b)) for p,k,b,h in records if k==b'mdat'];samples=[]
         for moof_pos,kind,moof,_header in records:
             if kind!=b'moof':continue
@@ -318,13 +319,20 @@ class M4A:
         entries=[e for e in self.fragments if e[3]>max(0,wanted-2048) and e[2]<finish+1024]
         if not entries:raise FastAudioError('الفترة خارج الأجزاء المتاحة.')
         first=None;previous=None;last=0
-        with open(target,'wb') as out,concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-            for samples in pool.map(self._fragment_samples,entries):
-                for timestamp,delta,data in samples:
-                    if timestamp+delta<=max(0,wanted-2048) or timestamp>=finish+1024:continue
-                    if previous is not None and timestamp!=previous:raise FastAudioError('انقطاع في توقيت أجزاء الصوت.')
-                    if first is None:first=timestamp
-                    adts(out,data,self.rate_index,self.channels);previous=timestamp+delta;last=previous
+        groups=[]
+        for entry in entries:
+            if groups and groups[-1][-1][0]+groups[-1][-1][1]==entry[0] and entry[0]+entry[1]-groups[-1][0][0]<=MAX_METADATA:groups[-1].append(entry)
+            else:groups.append([entry])
+        with open(target,'wb') as out:
+            for group in groups:
+                base=group[0][0];data=self.source.read(base,group[-1][0]+group[-1][1]-base)
+                for entry in group:
+                    part=data[entry[0]-base:entry[0]-base+entry[1]]
+                    for timestamp,delta,sample in self._fragment_samples(entry,part):
+                        if timestamp+delta<=max(0,wanted-2048) or timestamp>=finish+1024:continue
+                        if previous is not None and timestamp!=previous:raise FastAudioError('انقطاع في توقيت أجزاء الصوت.')
+                        if first is None:first=timestamp
+                        adts(out,sample,self.rate_index,self.channels);previous=timestamp+delta;last=previous
         if first is None or first>wanted or last<finish:raise FastAudioError('أجزاء الفترة غير مكتملة.')
         return (wanted-first)/self.scale,end-start
     def cut(self,start,end,target):
@@ -442,7 +450,7 @@ class Service:
         key=(video,start,end);started=time.monotonic()
         with self.lock:
             saved=self.cache.get(key)
-            if saved and saved[0]>started:self.cache.move_to_end(key);return saved[1],{'cache':'hit','totalMs':round((time.monotonic()-started)*1000),'sourceBytes':0}
+            if saved and saved[0]>started:self.cache.move_to_end(key);return saved[1],{'cache':'hit','totalMs':round((time.monotonic()-started)*1000),'sourceBytes':0,'clipSeconds':saved[2]}
         meta,resolver_hit=self.resolver.resolve(video);resolved=time.monotonic();remote=Remote(meta['url'],meta['length'],meta['headers']);index=M4A(remote)
         if not 3<=index.duration<=1800:raise FastAudioError('اختر فيديو مسجلًا حتى ٣٠ دقيقة.')
         with tempfile.TemporaryDirectory(prefix='maqam-fast-') as folder:
@@ -460,5 +468,5 @@ class Service:
                 if self.cache[k][0]<=now:self.bytes-=len(self.cache.pop(k)[1])
             while self.cache and (self.bytes+len(body)>32*1024*1024 or len(self.cache)>=32):self.bytes-=len(self.cache.popitem(last=False)[1][1])
             if key in self.cache:self.bytes-=len(self.cache.pop(key)[1])
-            self.cache[key]=(now+600,body);self.bytes+=len(body)
-        return body,{'cache':'miss','resolverCache':resolver_hit,'resolveMs':round((resolved-started)*1000),'rangeMs':round((fetched-resolved)*1000),'decodeMs':round((time.monotonic()-fetched)*1000),'totalMs':round((time.monotonic()-started)*1000),'sourceBytes':remote.bytes}
+            self.cache[key]=(now+600,body,duration);self.bytes+=len(body)
+        return body,{'cache':'miss','resolverCache':resolver_hit,'resolveMs':round((resolved-started)*1000),'rangeMs':round((fetched-resolved)*1000),'decodeMs':round((time.monotonic()-fetched)*1000),'totalMs':round((time.monotonic()-started)*1000),'sourceBytes':remote.bytes,'clipSeconds':duration}

@@ -130,8 +130,8 @@ class Tests(unittest.TestCase):
             with patch('server.DIRECT_ENABLED',False):
                 with self.assertRaises(urllib.error.HTTPError) as caught:urllib.request.urlopen(req)
                 self.assertEqual(caught.exception.code,503)
-            with patch('server.DIRECT_ENABLED',True),patch('server.DIRECT_SERVICE.clip',return_value=(b'RIFF-test',{'cache':'miss','sourceBytes':123,'totalMs':10})):
-                with urllib.request.urlopen(req) as r:self.assertEqual(r.read(),b'RIFF-test');self.assertEqual(r.headers['X-Maqam-Source-Bytes'],'123');self.assertIn('total;dur=10',r.headers['Server-Timing'])
+            with patch('server.DIRECT_ENABLED',True),patch('server.DIRECT_SERVICE.clip',return_value=(b'RIFF-test',{'cache':'miss','sourceBytes':123,'totalMs':10,'clipSeconds':3})):
+                with urllib.request.urlopen(req) as r:self.assertEqual(r.read(),b'RIFF-test');self.assertEqual(r.headers['X-Maqam-Source-Bytes'],'123');self.assertEqual(r.headers['X-Maqam-Clip-Seconds'],'3');self.assertIn('total;dur=10',r.headers['Server-Timing'])
         finally:server.shutdown();server.server_close();t.join()
 class TunelioTests(unittest.TestCase):
     def test_range_network_errors_are_actionable_without_signed_url_leaks(self):

@@ -169,8 +169,9 @@ class Handler(BaseHTTPRequestHandler):
         if timings is not None:
             self.send_header('X-Maqam-Cache', timings['cache'])
             self.send_header('X-Maqam-Source-Bytes', str(timings['sourceBytes']))
+            if 'clipSeconds' in timings:self.send_header('X-Maqam-Clip-Seconds',str(timings['clipSeconds']))
             self.send_header('Server-Timing', ', '.join(k[:-2]+';dur='+str(v) for k,v in timings.items() if k.endswith('Ms')))
-            self.send_header('Access-Control-Expose-Headers', 'Server-Timing, X-Maqam-Cache, X-Maqam-Source-Bytes')
+            self.send_header('Access-Control-Expose-Headers', 'Server-Timing, X-Maqam-Cache, X-Maqam-Source-Bytes, X-Maqam-Clip-Seconds')
         self.end_headers()
         self.wfile.write(body)
 
