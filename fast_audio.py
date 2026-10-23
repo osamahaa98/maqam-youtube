@@ -358,6 +358,7 @@ class M4A:
         return offset,end-start
 
 class Resolver:
+    cache_seconds=300
     def __init__(self):self.lock=threading.Lock();self.cache=OrderedDict();self.jobs=[threading.Lock() for _ in range(16)]
     def resolve(self,video):
         with self.jobs[hash(video)%len(self.jobs)]:return self._resolve(video)
@@ -367,7 +368,7 @@ class Resolver:
             item=self.cache.get(video)
             if item and item[0]>time.monotonic():self.cache.move_to_end(video);return item[1],True
         result=self._uncached(video)
-        ttl=min(300,result.get('expires',time.time()+330)-time.time()-30)
+        ttl=min(self.cache_seconds,result.get('expires',time.time()+self.cache_seconds+30)-time.time()-30)
         if ttl<=0:raise FastAudioError('انتهت صلاحية مصدر الصوت.')
         with self.lock:
             self.cache[video]=(time.monotonic()+ttl,result)
@@ -402,28 +403,46 @@ class Resolver:
 
 class TunelioResolver(Resolver):
     """One paid/trial resolution, then bounded native AAC reads. No conversion jobs.
-    The API credential is used only on /create; never on media requests or in logs.
+    Check the free balance endpoint before spending; preserve an operator reserve.
+    The API credential is used only on /credits and /create, never on media reads.
     """
-    def __init__(self,key=None):
+    cache_seconds=6*60*60
+    def __init__(self,key=None,credit_reserve=None):
         super().__init__();self.key=key if key is not None else os.environ.get('TUNELIO_API_KEY','')
-        self.opener=build_opener(NoRedirect())
-    def _uncached(self,video):
-        if not self.key or len(self.key)>512 or not self.key.isascii() or any(ord(c)<=32 or ord(c)==127 for c in self.key):raise FastAudioError('مفتاح خدمة الصوت المباشر غير مضبوط على الخادم.')
-        query=urlencode({'url':'https://www.youtube.com/watch?v='+video,'quality':'m4a'})
-        request=Request('https://tunelio.dev/create?'+query,headers={'Authorization':'Bearer '+self.key,'Accept':'application/json','User-Agent':'MaqamYouTube/1.0'})
+        self.credit_reserve=os.environ.get('TUNELIO_CREDIT_RESERVE','20') if credit_reserve is None else credit_reserve
+        self.spend_lock=threading.Lock();self.opener=build_opener(NoRedirect())
+    def _request_json(self,path,query=''):
+        request=Request('https://tunelio.dev/'+path+('?' + query if query else ''),headers={'Authorization':'Bearer '+self.key,'Accept':'application/json','User-Agent':'MaqamYouTube/1.0'})
         try:
             with self.opener.open(request,timeout=8) as response:
                 if response.status!=200:raise FastAudioError('خدمة الصوت المباشر لم تكمل الطلب.')
                 raw=response.read(65537)
         except HTTPError as error:
-            print('Tunelio create HTTP status='+str(error.code),file=sys.stderr,flush=True)
+            print('Tunelio '+path+' HTTP status='+str(error.code),file=sys.stderr,flush=True)
             messages={401:'مفتاح خدمة الصوت المباشر غير مقبول.',402:'انتهى رصيد خدمة الصوت المباشر.',404:'الفيديو غير متاح لخدمة الصوت.',429:'خدمة الصوت وصلت حد الطلبات؛ جرّب لاحقًا.'}
+            error.close()
             raise FastAudioError(messages.get(error.code,'خدمة الصوت المباشر غير متاحة الآن.')) from None
         except (URLError,TimeoutError):raise FastAudioError('انتهت مهلة اتصال خدمة الصوت المباشر.') from None
         try:
             if len(raw)>65536:raise ValueError()
             data=json.loads(raw)
             if not isinstance(data,dict):raise ValueError()
+        except (ValueError,TypeError):raise FastAudioError('بيانات خدمة الصوت المباشر غير صالحة.') from None
+        return data
+    def _uncached(self,video):
+        if not self.key or len(self.key)>512 or not self.key.isascii() or any(ord(c)<=32 or ord(c)==127 for c in self.key):raise FastAudioError('مفتاح خدمة الصوت المباشر غير مضبوط على الخادم.')
+        reserve=self.credit_reserve
+        if isinstance(reserve,str) and re.fullmatch(r'[0-9]{1,10}',reserve):reserve=int(reserve)
+        if type(reserve) is not int or not 0<=reserve<=1000000000:raise FastAudioError('حد حماية رصيد خدمة الصوت غير مضبوط.')
+        # Serialize balance+spend across videos in this process. A fresh account
+        # balance is checked after every restart, rather than resetting a counter.
+        with self.spend_lock:
+            balance=self._request_json('credits').get('credits')
+            if type(balance) is not int or balance<0:raise FastAudioError('تعذّر التحقق من الرصيد؛ أوقفنا الطلب لحمايته.')
+            if balance-10<reserve:raise FastAudioError('توقف الجلب المباشر لحماية رصيد الخدمة؛ جرّب المصدر البديل.')
+            query=urlencode({'url':'https://www.youtube.com/watch?v='+video,'quality':'m4a'})
+            data=self._request_json('create',query)
+        try:
             size=data['file_size'];expires=data['expires'];url=media_url(data['url'])
             if data.get('status')!='ok' or data.get('quality')!='m4a' or data.get('mode')!='audio' or type(size) is not int or not 0<size<=MAX_SOURCE or type(expires) is not int or expires<=time.time()+30:raise ValueError()
             if urlsplit(url).hostname!='tunelio.dev':raise ValueError()

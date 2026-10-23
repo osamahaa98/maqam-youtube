@@ -132,9 +132,10 @@ class Tests(unittest.TestCase):
         server=ThreadingHTTPServer(('127.0.0.1',0),module.Handler);t=threading.Thread(target=server.serve_forever,daemon=True);t.start()
         url=f'http://127.0.0.1:{server.server_port}/clip';req=urllib.request.Request(url,b'{"url":"https://youtu.be/abcdefghijk","start":0,"end":3}',{'Content-Type':'application/json','Origin':module.ORIGIN})
         try:
-            with patch('server.DIRECT_ENABLED',False):
+            with patch('server.DIRECT_ENABLED',False),patch('server.DIRECT_SERVICE.clip') as clip:
                 with self.assertRaises(urllib.error.HTTPError) as caught:urllib.request.urlopen(req)
                 self.assertEqual(caught.exception.code,503)
+                clip.assert_not_called()
             with patch('server.DIRECT_ENABLED',True),patch('server.DIRECT_SERVICE.clip',return_value=(b'RIFF-test',{'cache':'miss','sourceBytes':123,'totalMs':10,'clipSeconds':3})):
                 with urllib.request.urlopen(req) as r:self.assertEqual(r.read(),b'RIFF-test');self.assertEqual(r.headers['X-Maqam-Source-Bytes'],'123');self.assertEqual(r.headers['X-Maqam-Clip-Seconds'],'3');self.assertIn('total;dur=10',r.headers['Server-Timing'])
         finally:server.shutdown();server.server_close();t.join()
@@ -147,7 +148,7 @@ class TunelioTests(unittest.TestCase):
                 with self.assertRaises(FastAudioError) as caught:source.read(0,8)
             self.assertNotIn('private',log.getvalue());self.assertNotIn('private',str(caught.exception))
             self.assertEqual(source.bytes,0)
-    def resolver(self,change=None,body=None):
+    def resolver(self,change=None,body=None,credits=100):
         data={'status':'ok','quality':'m4a','mode':'audio','file_size':123456,'expires':int(time.time())+3600,'url':'https://tunelio.dev/tunnel?exp=123&sig=test'}
         data.update(change or {})
         raw=body if body is not None else json.dumps(data).encode()
@@ -155,15 +156,20 @@ class TunelioTests(unittest.TestCase):
         class Opener:
             calls=[]
             def open(self,request,timeout):
-                self.calls.append((request,timeout));return Response(raw)
+                self.calls.append((request,timeout))
+                if urllib.parse.urlsplit(request.full_url).path=='/credits':return Response(json.dumps({'credits':self.balance,'plan':'trial'}).encode())
+                self.balance-=10
+                return Response(raw)
         r=TunelioResolver('tnl_test_only');r.opener=Opener();r.opener.calls=[]
+        r.opener.balance=credits
         return r
     def test_one_m4a_resolution_concurrent_cache_and_secret_scope(self):
         r=self.resolver()
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
             results=list(pool.map(lambda _:r.resolve('abcdefghijk'),range(2)))
-        self.assertEqual(len(r.opener.calls),1)
-        req,timeout=r.opener.calls[0]
+        self.assertEqual(len(r.opener.calls),2)
+        self.assertEqual(urllib.parse.urlsplit(r.opener.calls[0][0].full_url).path,'/credits')
+        req,timeout=r.opener.calls[1]
         query=urllib.parse.parse_qs(urllib.parse.urlsplit(req.full_url).query)
         self.assertEqual(query['quality'],['m4a']);self.assertEqual(timeout,8)
         self.assertEqual(req.get_header('Authorization'),'Bearer tnl_test_only')
@@ -187,8 +193,11 @@ class TunelioTests(unittest.TestCase):
             self.assertEqual(len(r.opener.calls),0)
     def test_http_errors_never_expose_vendor_body_credentials_or_signed_urls(self):
         for status in (401,402,404,429,500):
-            r=self.resolver()
-            with patch.object(r.opener,'open',side_effect=urllib.error.HTTPError('https://tunelio.dev/create',status,'secret-detail',{},io.BytesIO(b'tnl_test_only'))):
+            r=self.resolver();original=r.opener.open
+            def fail_create(request,timeout):
+                if urllib.parse.urlsplit(request.full_url).path=='/credits':return original(request,timeout)
+                raise urllib.error.HTTPError('https://tunelio.dev/create',status,'secret-detail',{},io.BytesIO(b'tnl_test_only'))
+            with patch.object(r.opener,'open',side_effect=fail_create):
                 with self.assertRaises(FastAudioError) as caught:r.resolve('abcdefghijk')
             self.assertNotIn('tnl_test_only',str(caught.exception));self.assertNotIn('secret-detail',str(caught.exception))
             self.assertEqual(len(r.cache),0)
@@ -197,7 +206,46 @@ class TunelioTests(unittest.TestCase):
         r.resolve('abcdefghijk')
         self.assertLessEqual(r.cache['abcdefghijk'][0]-time.monotonic(),30)
         with patch('fast_audio.time.monotonic',return_value=time.monotonic()+31):r.resolve('abcdefghijk')
-        self.assertEqual(len(r.opener.calls),2)
+        self.assertEqual(len(r.opener.calls),4)
+    def test_valid_signed_link_is_reused_after_five_minutes(self):
+        r=self.resolver({'expires':int(time.time())+6*60*60})
+        r.resolve('abcdefghijk')
+        self.assertGreater(r.cache['abcdefghijk'][0]-time.monotonic(),5*60*60)
+        with patch('fast_audio.time.monotonic',return_value=time.monotonic()+601):_,hit=r.resolve('abcdefghijk')
+        self.assertTrue(hit);self.assertEqual(len(r.opener.calls),2)
+    def test_reserve_blocks_paid_call_even_after_a_restart(self):
+        r=self.resolver(credits=20)
+        for resolver in (r,TunelioResolver('tnl_test_only')):
+            resolver.opener=r.opener
+            with self.assertRaises(FastAudioError):resolver.resolve('abcdefghijk')
+        self.assertEqual([urllib.parse.urlsplit(req.full_url).path for req,_ in r.opener.calls],['/credits','/credits'])
+        self.assertEqual(r.opener.balance,20)
+    def test_concurrent_different_videos_cannot_both_spend_the_reserve(self):
+        r=self.resolver(credits=30)
+        def attempt(video):
+            try:return r.resolve(video)
+            except FastAudioError:return None
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:results=list(pool.map(attempt,['abcdefghijk','lmnopqrstuv']))
+        self.assertEqual(sum(result is not None for result in results),1)
+        self.assertEqual(r.opener.balance,20)
+        self.assertEqual(sum(urllib.parse.urlsplit(req.full_url).path=='/create' for req,_ in r.opener.calls),1)
+    def test_balance_errors_fail_closed_without_a_paid_request(self):
+        class Response(io.BytesIO):status=200
+        for raw in (b'{}',b'{"credits":true}',b'{"credits":-1}',b'{"credits":"100"}',b'not-json'):
+            r=self.resolver()
+            with patch.object(r.opener,'open',return_value=Response(raw)) as opener:
+                with self.assertRaises(FastAudioError):r.resolve('abcdefghijk')
+                self.assertEqual(opener.call_count,1)
+                self.assertEqual(urllib.parse.urlsplit(opener.call_args.args[0].full_url).path,'/credits')
+        r=self.resolver()
+        with patch.object(r.opener,'open',side_effect=TimeoutError('private')) as opener:
+            with self.assertRaises(FastAudioError):r.resolve('abcdefghijk')
+            self.assertEqual(opener.call_count,1)
+    def test_invalid_reserve_never_contacts_provider(self):
+        for reserve in ('bad','-1','1.5','1000000001',True):
+            r=self.resolver();r.credit_reserve=reserve
+            with self.assertRaises(FastAudioError):r.resolve('abcdefghijk')
+            self.assertEqual(len(r.opener.calls),0)
     def test_explicit_provider_configuration(self):
         with patch.dict('os.environ',{'MAQAM_AUDIO_RESOLVER':'tunelio','TUNELIO_API_KEY':'tnl_test_only'}):
             self.assertIsInstance(configured_resolver(),TunelioResolver)

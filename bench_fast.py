@@ -1,15 +1,17 @@
 """Run ON THE TARGET HOST. This times source import only, not browser analysis.
 Exit nonzero on a failed source or missed latency gate; never count failure as fast.
 """
-import argparse,json,time,math
+import argparse,json,time,math,os
 from pathlib import Path
 from fast_audio import Service
 
 def percentile(values,p):return sorted(values)[max(0,math.ceil(len(values)*p)-1)] if values else None
 
 def main():
-    parser=argparse.ArgumentParser();parser.add_argument('--manifest',type=Path,required=True);parser.add_argument('--output',type=Path,required=True);parser.add_argument('--seconds',type=float,default=30);parser.add_argument('--cold-p95-seconds',type=float,default=5);args=parser.parse_args()
-    records=json.loads(args.manifest.read_text())['records'];service=Service();results=[]
+    parser=argparse.ArgumentParser();parser.add_argument('--manifest',type=Path,required=True);parser.add_argument('--output',type=Path,required=True);parser.add_argument('--seconds',type=float,default=30);parser.add_argument('--cold-p95-seconds',type=float,default=5);parser.add_argument('--credit-budget',type=int,default=0,help='Owner-approved live test budget, in credits; no automatic paid probes.');args=parser.parse_args()
+    records=json.loads(args.manifest.read_text())['records']
+    if os.environ.get('MAQAM_AUDIO_RESOLVER')=='tunelio' and args.credit_budget<10*len(records):parser.error('No requests sent: set an explicit credit budget covering up to 10 credits per source.')
+    service=Service();results=[]
     for record in records:
         video=record['video_id'];start=float(record.get('start',0));begin=time.monotonic()
         try:
