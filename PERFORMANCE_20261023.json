@@ -1,0 +1,142 @@
+{
+  "date": "2026-10-23",
+  "status": "initial working integration, not commercial acceptance",
+  "backend_commit": "a3d5461d8a8523457bbb7220f584b6b9e58a30d2",
+  "backend_deploy": "dep-dbdi92ui0phs739tcfe0",
+  "notes": [
+    "Server timings exclude client network and maqam analysis.",
+    "Only 2 distinct real videos tested; the preregistered 10-video gate has not passed.",
+    "Earlier 120s WAV import timed out; final M4A requests succeeded.",
+    "Render was running during final requests; idle startup and a real phone were not tested.",
+    "Browser QA uploaded the actual returned M4A and completed its 107.8s analysis. Direct native import could not be tested in preview because its Origin differs from production.",
+    "No model weights or analysis scoring changed."
+  ],
+  "runs": [
+    {
+      "stage": "tunelio-smoke",
+      "http_status": 502,
+      "elapsed_seconds": 8.704676523999751,
+      "error": "{\"error\": \"تعذّر تجهيز الصوت؛ جرّب رفع الملف.\"}"
+    },
+    {
+      "stage": "tunelio-diagnostic",
+      "http_status": 422,
+      "elapsed_seconds": 6.800979126999664,
+      "error": "{\"error\": \"مصدر الصوت رفض جلب الفترة (403).\"}"
+    },
+    {
+      "stage": "tunelio-headers",
+      "http_status": 422,
+      "elapsed_seconds": 11.064504431999922,
+      "error": "{\"error\": \"عدد عينات غير صالح.\"}"
+    },
+    {
+      "stage": "tunelio-fragmented",
+      "scope": "one real HTTP request; client elapsed includes network, server phases in separate headers",
+      "video_id": "K_Vlxr6U3lg",
+      "start": 0,
+      "requested_seconds": 30,
+      "ok": true,
+      "http_status": 200,
+      "server_timing": "resolve;dur=873, range;dur=8525, decode;dur=940, total;dur=10338, wait;dur=0",
+      "source_bytes": "647282",
+      "cache": "miss",
+      "wav_bytes": 1323078,
+      "audio": {
+        "seconds": 30.0,
+        "rate": 22050,
+        "channels": 1
+      },
+      "client_elapsed_seconds": 18.043150964999768
+    },
+    {
+      "stage": "tunelio-prefix",
+      "scope": "one real HTTP request; client elapsed includes network, server phases in separate headers",
+      "video_id": "K_Vlxr6U3lg",
+      "start": 0,
+      "requested_seconds": 30,
+      "ok": true,
+      "http_status": 200,
+      "server_timing": "resolve;dur=803, range;dur=4927, decode;dur=837, total;dur=6568, wait;dur=0",
+      "source_bytes": "712022",
+      "cache": "miss",
+      "wav_bytes": 1323078,
+      "audio": {
+        "seconds": 30.0,
+        "rate": 22050,
+        "channels": 1
+      },
+      "client_elapsed_seconds": 14.356914648000384
+    },
+    {
+      "stage": "tunelio-coalesced",
+      "scope": "one real HTTP request; client elapsed includes network, server phases in separate headers",
+      "video_id": "K_Vlxr6U3lg",
+      "start": 0,
+      "requested_seconds": 30,
+      "ok": true,
+      "http_status": 200,
+      "server_timing": "resolve;dur=874, range;dur=3574, decode;dur=939, total;dur=5387, wait;dur=0",
+      "source_bytes": "712022",
+      "cache": "miss",
+      "wav_bytes": 1323078,
+      "audio": {
+        "seconds": 30.0,
+        "rate": 22050,
+        "channels": 1
+      },
+      "client_elapsed_seconds": 14.345778263999819
+    },
+    {
+      "stage": "tunelio-default120",
+      "scope": "one real HTTP request; client elapsed includes network, server phases in separate headers",
+      "video_id": "K_Vlxr6U3lg",
+      "start": 0,
+      "requested_seconds": 120.0,
+      "ok": false,
+      "http_status": 422,
+      "error": "{\"error\": \"انتهت مهلة اتصال مصدر الصوت أثناء جلب الفترة.\"}",
+      "client_elapsed_seconds": 18.9056860769997
+    },
+    {
+      "stage": "tunelio-m4a120",
+      "scope": "one real HTTP request; client elapsed includes network, server phases in separate headers",
+      "video_id": "K_Vlxr6U3lg",
+      "start": 0,
+      "requested_seconds": 120.0,
+      "ok": true,
+      "http_status": 200,
+      "server_timing": "resolve;dur=822, range;dur=3508, mux;dur=797, total;dur=5127, wait;dur=0",
+      "source_bytes": "1809840",
+      "cache": "miss",
+      "audio_bytes": 1743972,
+      "client_elapsed_seconds": 13.685086186999797,
+      "audio": {
+        "seconds": 107.787029,
+        "rate": 44100,
+        "channels": 2,
+        "mime": "audio/mp4"
+      }
+    },
+    {
+      "stage": "tunelio-reference120",
+      "scope": "one real HTTP request; client elapsed includes network, server phases in separate headers",
+      "video_id": "EE8cHyjCNLE",
+      "start": 0,
+      "requested_seconds": 120.0,
+      "ok": true,
+      "http_status": 200,
+      "server_timing": "resolve;dur=1283, range;dur=3310, mux;dur=701, total;dur=5294, wait;dur=0",
+      "source_bytes": "2166500",
+      "cache": "miss",
+      "audio_bytes": 1941918,
+      "client_elapsed_seconds": 12.183234565999555,
+      "audio": {
+        "seconds": 120.000726,
+        "rate": 44100,
+        "channels": 2,
+        "mime": "audio/mp4"
+      }
+    }
+  ]
+}
