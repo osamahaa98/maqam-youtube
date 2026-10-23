@@ -100,6 +100,10 @@ class Tests(unittest.TestCase):
                 requests.clear();auth.clear()
                 source=Remote(url,len(data),{'Authorization':'Bearer tnl_test_only'});source.opener=Opener();n=CHUNK*2+100
                 self.assertEqual(source.read(7,n),data[7:7+n]);self.assertEqual(source.bytes,n);self.assertEqual(len(requests),3);self.assertEqual(auth,[None]*3)
+            requests.clear()
+            metadata=Remote('https://tunelio.dev/tunnel?sig=test',len(data));metadata.opener=Opener()
+            self.assertEqual(metadata.read(0,8),data[:8]);self.assertEqual(metadata.read(28,8),data[28:36]);self.assertEqual(metadata.read(100,2000),data[100:2100])
+            self.assertEqual(len(requests),1);self.assertEqual(metadata.bytes,65536)
             source.opener.path='/ignored'
             with self.assertRaises(FastAudioError):source.read(0,20)
         finally:server.shutdown();server.server_close();thread.join()

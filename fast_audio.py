@@ -27,6 +27,7 @@ MAX_METADATA=4*1024*1024
 MAX_SOURCE=40*1024*1024
 MAX_TRANSFER=12*1024*1024
 CHUNK=128*1024
+PREFIX=64*1024
 RATES=[96000,88200,64000,48000,44100,32000,24000,22050,16000,12000,11025,8000,7350]
 
 class FastAudioError(ValueError):pass
@@ -57,8 +58,18 @@ class Remote:
         if not isinstance(length,int) or not 0<length<=MAX_SOURCE:raise FastAudioError('حجم مصدر الصوت غير مدعوم.')
         self.length=length;self.bytes=0;self.reserved=0;self.headers=headers or {};self.deadline=time.monotonic()+20
         self.opener=build_opener(NoRedirect());self.transfer_lock=threading.Lock()
+        self.prefix=None;self.prefix_lock=threading.Lock()
     def read(self,offset,size):
         if offset<0 or size<0 or offset+size>self.length or size>MAX_METADATA:raise FastAudioError('نطاق صوت غير صالح.')
+        if size==0:return b''
+        # One bounded prefix covers ftyp/moov/sidx in ordinary YouTube AAC.
+        # Avoid a new TLS round trip for every 8-byte box header.
+        if offset+size<=min(PREFIX,self.length):
+            with self.prefix_lock:
+                if self.prefix is None:self.prefix=self._read_remote(0,min(PREFIX,self.length))
+                return self.prefix[offset:offset+size]
+        return self._read_remote(offset,size)
+    def _read_remote(self,offset,size):
         with self.transfer_lock:
             if self.reserved+size>MAX_TRANSFER:raise FastAudioError('تجاوز جلب الفترة الحد المحدد.')
             self.reserved+=size
