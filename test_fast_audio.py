@@ -27,10 +27,11 @@ class Tests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp=tempfile.TemporaryDirectory();cls.folder=Path(cls.tmp.name)
-        cls.fast=cls.folder/'fast.m4a';cls.tail=cls.folder/'tail.m4a'
+        cls.fast=cls.folder/'fast.m4a';cls.tail=cls.folder/'tail.m4a';cls.fragmented=cls.folder/'fragmented.m4a'
         command=['ffmpeg','-v','error','-f','lavfi','-i','aevalsrc=if(lt(t\\,590)\\,0.3*sin(2*PI*220*t)\\,0.3*sin(2*PI*440*t)):s=44100:d=600','-c:a','aac','-b:a','128k','-movflags','+faststart',str(cls.fast)]
         subprocess.run(command,check=True,timeout=30)
         subprocess.run(['ffmpeg','-v','error','-i',str(cls.fast),'-t','10','-c:a','copy',str(cls.tail)],check=True,timeout=10)
+        subprocess.run(['ffmpeg','-v','error','-i',str(cls.fast),'-c:a','copy','-movflags','+dash+global_sidx','-frag_duration','5000000',str(cls.fragmented)],check=True,timeout=10)
         cls.data=cls.fast.read_bytes()
     @classmethod
     def tearDownClass(cls):cls.tmp.cleanup()
@@ -50,6 +51,35 @@ class Tests(unittest.TestCase):
         with self.assertRaises(FastAudioError):M4A(FileSource(b'not m4a'))
         for url in ('http://x.googlevideo.com/audio','https://googlevideo.com.evil.test/audio','https://u:p@x.googlevideo.com/audio','https://x.googlevideo.com:444/audio','https://localhost/audio'):
             with self.assertRaises(FastAudioError):media_url(url)
+    def test_fragmented_aac_late_fractional_clip_matches_full_decode(self):
+        source=FileSource(self.fragmented.read_bytes());m=M4A(source)
+        self.assertTrue(m.fragmented);self.assertAlmostEqual(m.duration,600,delta=.06)
+        target=self.folder/'fragment-cut.aac';offset,duration=m.cut(589.125,592.625,target)
+        command=['ffmpeg','-v','error','-ss',str(offset),'-i',str(target),'-t',str(duration),'-ar','44100','-ac','1','-f','f32le','-']
+        pcm=subprocess.check_output(command,timeout=8)
+        ref=subprocess.check_output(['ffmpeg','-v','error','-ss','589.125','-i',str(self.fragmented),'-t','3.5','-ar','44100','-ac','1','-f','f32le','-'],timeout=8)
+        self.assertAlmostEqual(len(pcm)/4/44100,3.5,delta=.04)
+        a=struct.unpack('<'+'f'*(len(pcm)//4),pcm);b=struct.unpack('<'+'f'*(len(ref)//4),ref)
+        lo=int(.15*44100);hi=min(len(a),len(b))-int(.1*44100)
+        # FFmpeg quantizes -ss to microseconds: a fractional sample can round
+        # differently for a long source versus a short ADTS preroll. Allow 1
+        # native sample (23 microseconds), then require matching waveforms.
+        denominator=sum(b[i]**2 for i in range(lo,hi))
+        normalized_error=min(sum((a[i+lag]-b[i])**2 for i in range(lo,hi))/denominator for lag in (-1,0,1))
+        self.assertLess(normalized_error,.000001)
+        self.assertLess(source.bytes,source.length*.05)
+        print('Fragmented AAC late fractional clip: source=%d, read=%d bytes, normalized waveform error=%.8f'%(source.length,source.bytes,normalized_error),flush=True)
+    def test_fragment_index_rejects_hierarchy_and_invalid_sample_offsets(self):
+        data=bytearray(self.fragmented.read_bytes());i=data.index(b'sidx')+4
+        version=data[i];p=i+12+(16 if version else 8)+4
+        bad=bytearray(data);struct.pack_into('>I',bad,p,0x80000010)
+        with self.assertRaises(FastAudioError):M4A(FileSource(bytes(bad)))
+        bad=bytearray(data);bad[i-4:i]=b'free'
+        with self.assertRaises(FastAudioError):M4A(FileSource(bytes(bad)))
+        bad=bytearray(data);p=bad.index(b'trun')+4;flags=struct.unpack_from('>I',bad,p)[0]&0xffffff
+        self.assertTrue(flags&1);struct.pack_into('>I',bad,p+8,0x7fffffff)
+        m=M4A(FileSource(bytes(bad)))
+        with self.assertRaises(FastAudioError):m.cut(0,3,self.folder/'invalid.aac')
     def test_real_http_bounded_parallel_ranges_and_ignored_range_rejection(self):
         data=self.data;requests=[];auth=[]
         class Handler(BaseHTTPRequestHandler):

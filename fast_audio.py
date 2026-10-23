@@ -55,11 +55,13 @@ class Remote:
     def __init__(self,url,length,headers=None):
         self.url=media_url(url)
         if not isinstance(length,int) or not 0<length<=MAX_SOURCE:raise FastAudioError('حجم مصدر الصوت غير مدعوم.')
-        self.length=length;self.bytes=0;self.headers=headers or {};self.deadline=time.monotonic()+20
+        self.length=length;self.bytes=0;self.reserved=0;self.headers=headers or {};self.deadline=time.monotonic()+20
         self.opener=build_opener(NoRedirect());self.transfer_lock=threading.Lock()
     def read(self,offset,size):
         if offset<0 or size<0 or offset+size>self.length or size>MAX_METADATA:raise FastAudioError('نطاق صوت غير صالح.')
-        if self.bytes+size>MAX_TRANSFER:raise FastAudioError('تجاوز جلب الفترة الحد المحدد.')
+        with self.transfer_lock:
+            if self.reserved+size>MAX_TRANSFER:raise FastAudioError('تجاوز جلب الفترة الحد المحدد.')
+            self.reserved+=size
         def fetch(pos):
             if time.monotonic()>self.deadline:raise FastAudioError('انتهت مهلة جلب الفترة المباشرة.')
             count=min(CHUNK,offset+size-pos)
@@ -137,6 +139,18 @@ def table(data,width):
     if count>200000 or 8+count*width!=len(data):raise FastAudioError('جدول صوت غير صالح.')
     return [data[p:p+width] for p in range(8,len(data),width)]
 
+def located_boxes(data):
+    pos=0
+    for kind,payload in boxes(data):
+        header=16 if u32(data,pos)==1 else 8
+        yield pos,kind,payload,header
+        pos+=len(payload)+header
+
+def adts(out,data,rate_index,channels):
+    n=len(data)+7
+    if not 7<n<=8191:raise FastAudioError('حجم عينة AAC غير صالح.')
+    out.write(bytes([255,241,64|(rate_index<<2)|(channels>>2),((channels&3)<<6)|(n>>11),(n>>3)&255,((n&7)<<5)|31,252]));out.write(data)
+
 class M4A:
     def __init__(self,source):
         self.source=source;pos=0;moov=None
@@ -170,7 +184,18 @@ class M4A:
         bits=int.from_bytes(asc[:2],'big');aot=bits>>11;self.rate_index=(bits>>7)&15;self.channels=(bits>>3)&15
         if aot!=2 or self.rate_index>=len(RATES) or RATES[self.rate_index]!=self.scale or not 1<=self.channels<=2:
             raise FastAudioError('المسار السريع يدعم AAC-LC أحاديًا أو ستيريو فقط.')
+        self.media_start=0
+        try:
+            elst=child(child(track,b'edts'),b'elst')
+            if u32(elst,4)!=1 or elst[0]!=0 or len(elst)!=20:raise FastAudioError('تحرير توقيت غير مدعوم.')
+            self.media_start=struct.unpack_from('>i',elst,12)[0]
+            if not 0<=self.media_start<=4096:raise FastAudioError('بداية صوت غير مدعومة.')
+        except FastAudioError as e:
+            if 'تحرير' in str(e) or 'بداية' in str(e):raise
+        self.fragmented=False
         stsz=child(stbl,b'stsz');fixed=u32(stsz,4);count=u32(stsz,8)
+        if count==0 and len(stsz)==12:
+            self._fragment_index(moov,track);self.fragmented=True;return
         if not 1<=count<=200000 or len(stsz)!=(12 if fixed else 12+count*4):raise FastAudioError('عدد عينات غير صالح.')
         self.sizes=[fixed]*count if fixed else [u32(stsz,12+i*4) for i in range(count)]
         if any(not 0<n<=8184 for n in self.sizes):raise FastAudioError('حجم عينة AAC غير صالح.')
@@ -194,19 +219,108 @@ class M4A:
                 if offset<0 or offset+self.sizes[s]>source.length:raise FastAudioError('عنوان عينة خارج المصدر.')
                 self.offsets.append(offset);offset+=self.sizes[s];s+=1
         if s!=count:raise FastAudioError('توزيع عينات غير مكتمل.')
-        self.media_start=0
-        try:
-            elst=child(child(track,b'edts'),b'elst')
-            if u32(elst,4)!=1 or elst[0]!=0 or len(elst)!=20:raise FastAudioError('تحرير توقيت غير مدعوم.')
-            self.media_start=struct.unpack_from('>i',elst,12)[0]
-            if not 0<=self.media_start<=4096:raise FastAudioError('بداية صوت غير مدعومة.')
-        except FastAudioError as e:
-            if 'تحرير' in str(e) or 'بداية' in str(e):raise
         self.duration=(self.times[-1]-self.media_start)/self.scale
+    def _fragment_index(self,moov,track):
+        tkhd=child(track,b'tkhd');self.track_id=u32(tkhd,12 if tkhd[0]==0 else 20)
+        self.defaults=None
+        for kind,data in boxes(child(moov,b'mvex')):
+            if kind==b'trex' and len(data)==24 and u32(data,4)==self.track_id:
+                if u32(data,8)!=1:raise FastAudioError('وصف مسار مجزأ غير مدعوم.')
+                self.defaults=(u32(data,12),u32(data,16))
+        if self.defaults is None:raise FastAudioError('لا توجد إعدادات الصوت المجزأ.')
+        pos=0;self.fragments=[]
+        for _ in range(64):
+            if pos+8>self.source.length:break
+            size,kind=struct.unpack('>I4s',self.source.read(pos,8));header=8
+            if size==1:size=struct.unpack('>Q',self.source.read(pos+8,8))[0];header=16
+            if size<header or pos+size>self.source.length:raise FastAudioError('فهرس مجزأ غير صالح.')
+            if kind==b'sidx':
+                if size>MAX_METADATA:raise FastAudioError('فهرس مجزأ كبير.')
+                data=self.source.read(pos+header,size-header)
+                if len(data)<24:raise FastAudioError('فهرس مجزأ غير مكتمل.')
+                version=data[0]
+                if version==1 and len(data)<32:raise FastAudioError('فهرس مجزأ غير مكتمل.')
+                if version not in (0,1) or u32(data,4)!=self.track_id or u32(data,8)!=self.scale:raise FastAudioError('فهرس مجزأ غير مدعوم.')
+                width=8 if version==1 else 4;p=12
+                timestamp=int.from_bytes(data[p:p+width],'big');p+=width
+                offset=pos+size+int.from_bytes(data[p:p+width],'big');p+=width
+                if p+4>len(data):raise FastAudioError('فهرس مجزأ غير مكتمل.')
+                count=struct.unpack_from('>H',data,p+2)[0];p+=4
+                if not 1<=count<=4096 or len(data)!=p+12*count:raise FastAudioError('عدد أجزاء غير صالح.')
+                for _ in range(count):
+                    length,duration,_sap=struct.unpack_from('>III',data,p);p+=12
+                    if length>>31 or not 8<=length<=MAX_METADATA or not duration or offset+length>self.source.length:raise FastAudioError('عنوان جزء غير صالح.')
+                    self.fragments.append((offset,length,timestamp,timestamp+duration));offset+=length;timestamp+=duration
+                self.duration=(timestamp-self.media_start)/self.scale
+                if not 3<=self.duration<=1800:raise FastAudioError('مدة الصوت المجزأ غير مدعومة.')
+                return
+            pos+=size
+        raise FastAudioError('الصوت المجزأ يحتاج فهرسًا مباشرًا للفترات.')
+    def _fragment_samples(self,entry):
+        offset,length,_,_=entry;data=self.source.read(offset,length)
+        records=list(located_boxes(data));media=[(p+h,p+h+len(b)) for p,k,b,h in records if k==b'mdat'];samples=[]
+        for moof_pos,kind,moof,_header in records:
+            if kind!=b'moof':continue
+            trafs=[b for k,b in boxes(moof) if k==b'traf']
+            for traf in trafs:
+                tfhd=child(traf,b'tfhd')
+                if u32(tfhd,4)!=self.track_id:continue
+                flags=u32(tfhd,0)&0xffffff;p=8;base=moof_pos
+                if flags&1:
+                    if p+8>len(tfhd):raise FastAudioError('عنوان جزء غير مكتمل.')
+                    base=int.from_bytes(tfhd[p:p+8],'big')-offset;p+=8
+                elif not flags&0x020000 and len(trafs)!=1:raise FastAudioError('عنونة الأجزاء غير مدعومة.')
+                if flags&2:
+                    if u32(tfhd,p)!=1:raise FastAudioError('وصف جزء غير مدعوم.')
+                    p+=4
+                duration,size=self.defaults
+                if flags&8:duration=u32(tfhd,p);p+=4
+                if flags&16:size=u32(tfhd,p);p+=4
+                if flags&32:p+=4
+                if p!=len(tfhd) or flags&0x010000:raise FastAudioError('إعداد جزء غير صالح.')
+                tfdt=child(traf,b'tfdt')
+                if not tfdt or tfdt[0] not in (0,1) or len(tfdt)!=(12 if tfdt[0] else 8):raise FastAudioError('توقيت جزء غير صالح.')
+                timestamp=int.from_bytes(tfdt[4:],'big');cursor=None
+                for k,trun in boxes(traf):
+                    if k!=b'trun':continue
+                    flags=u32(trun,0)&0xffffff;count=u32(trun,4);p=8
+                    if not 1<=count<=200000:raise FastAudioError('عينات جزء غير صالحة.')
+                    if flags&1:
+                        value=u32(trun,p);cursor=base+(value if value<2**31 else value-2**32);p+=4
+                    if flags&4:p+=4
+                    if cursor is None:raise FastAudioError('عنوان عينات الجزء مفقود.')
+                    for _ in range(count):
+                        delta=duration;n=size
+                        if flags&0x100:delta=u32(trun,p);p+=4
+                        if flags&0x200:n=u32(trun,p);p+=4
+                        if flags&0x400:p+=4
+                        if flags&0x800:
+                            if u32(trun,p)!=0:raise FastAudioError('إزاحة صوت مجزأ غير مدعومة.')
+                            p+=4
+                        if not 0<delta<=1024 or not 0<n<=8184 or not any(lo<=cursor and cursor+n<=hi for lo,hi in media):raise FastAudioError('عينة جزء خارج البيانات.')
+                        samples.append((timestamp,delta,data[cursor:cursor+n]));timestamp+=delta;cursor+=n
+                    if p!=len(trun):raise FastAudioError('جدول جزء غير صالح.')
+        if not samples:raise FastAudioError('لا توجد عينات في الجزء.')
+        return samples
+    def _fragment_cut(self,start,end,target):
+        wanted=self.media_start+start*self.scale;finish=self.media_start+end*self.scale
+        entries=[e for e in self.fragments if e[3]>max(0,wanted-2048) and e[2]<finish+1024]
+        if not entries:raise FastAudioError('الفترة خارج الأجزاء المتاحة.')
+        first=None;previous=None;last=0
+        with open(target,'wb') as out,concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            for samples in pool.map(self._fragment_samples,entries):
+                for timestamp,delta,data in samples:
+                    if timestamp+delta<=max(0,wanted-2048) or timestamp>=finish+1024:continue
+                    if previous is not None and timestamp!=previous:raise FastAudioError('انقطاع في توقيت أجزاء الصوت.')
+                    if first is None:first=timestamp
+                    adts(out,data,self.rate_index,self.channels);previous=timestamp+delta;last=previous
+        if first is None or first>wanted or last<finish:raise FastAudioError('أجزاء الفترة غير مكتملة.')
+        return (wanted-first)/self.scale,end-start
     def cut(self,start,end,target):
         if not all(map(math.isfinite,(start,end))) or start<0 or not 3<=end-start<=180:raise FastAudioError('فترة غير صالحة.')
         end=min(end,self.duration)
         if end-start<3:raise FastAudioError('الفترة خارج المصدر.')
+        if self.fragmented:return self._fragment_cut(start,end,target)
         first=max(0,bisect.bisect_right(self.times,self.media_start+start*self.scale)-3)
         last=min(len(self.sizes),bisect.bisect_left(self.times,self.media_start+end*self.scale)+1)
         # Coalesce consecutive samples into bounded reads. Never read the full mdat.
