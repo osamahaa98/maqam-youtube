@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import traceback
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -232,7 +233,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply(200, import_audio(data), 'audio/wav')
         except ValueError as e:
             self.error(422, str(e))
-        except Exception:
+        except Exception as error:
+            frames=' > '.join(Path(frame.filename).name+':'+str(frame.lineno)+':'+frame.name for frame in traceback.extract_tb(error.__traceback__) if Path(frame.filename).name in ('server.py','fast_audio.py'))
+            print('Audio import unexpected exception type='+type(error).__name__+' frames='+frames,file=sys.stderr,flush=True)
             self.error(502, 'تعذّر تجهيز الصوت؛ جرّب رفع الملف.')
         finally:
             SLOTS.release()

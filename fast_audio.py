@@ -57,13 +57,20 @@ class Remote:
             count=min(CHUNK,offset+size-pos)
             headers={k:v for k,v in self.headers.items() if k.lower() in ('user-agent','accept','accept-language')}
             headers['Range']=f'bytes={pos}-{pos+count-1}'
-            with self.opener.open(Request(self.url,headers=headers),timeout=min(8,max(.1,self.deadline-time.monotonic()))) as r:
-                expected=f'bytes {pos}-{pos+count-1}/{self.length}'
-                if r.status!=206 or r.headers.get('Content-Range')!=expected:raise FastAudioError('المصدر لم يحترم نطاق الصوت؛ أوقفنا الطلب.')
-                data=r.read(count+1)
-                if len(data)!=count:raise FastAudioError('وصلت فترة صوت غير مكتملة.')
-                with self.transfer_lock:self.bytes+=len(data)
-                return data
+            try:
+                with self.opener.open(Request(self.url,headers=headers),timeout=min(8,max(.1,self.deadline-time.monotonic()))) as r:
+                    expected=f'bytes {pos}-{pos+count-1}/{self.length}'
+                    if r.status!=206 or r.headers.get('Content-Range')!=expected:raise FastAudioError('المصدر لم يحترم نطاق الصوت؛ أوقفنا الطلب.')
+                    data=r.read(count+1)
+                    if len(data)!=count:raise FastAudioError('وصلت فترة صوت غير مكتملة.')
+                    with self.transfer_lock:self.bytes+=len(data)
+                    return data
+            except HTTPError as error:
+                print('Audio range HTTP status='+str(error.code),file=sys.stderr,flush=True)
+                raise FastAudioError('مصدر الصوت رفض جلب الفترة ('+str(error.code)+').') from None
+            except (URLError,TimeoutError) as error:
+                print('Audio range network failure type='+type(error).__name__,file=sys.stderr,flush=True)
+                raise FastAudioError('انتهت مهلة اتصال مصدر الصوت أثناء جلب الفترة.') from None
         positions=range(offset,offset+size,CHUNK)
         if size<=CHUNK:return b''.join(fetch(p) for p in positions)
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:return b''.join(pool.map(fetch,positions))
@@ -268,6 +275,7 @@ class TunelioResolver(Resolver):
                 if response.status!=200:raise FastAudioError('خدمة الصوت المباشر لم تكمل الطلب.')
                 raw=response.read(65537)
         except HTTPError as error:
+            print('Tunelio create HTTP status='+str(error.code),file=sys.stderr,flush=True)
             messages={401:'مفتاح خدمة الصوت المباشر غير مقبول.',402:'انتهى رصيد خدمة الصوت المباشر.',404:'الفيديو غير متاح لخدمة الصوت.',429:'خدمة الصوت وصلت حد الطلبات؛ جرّب لاحقًا.'}
             raise FastAudioError(messages.get(error.code,'خدمة الصوت المباشر غير متاحة الآن.')) from None
         except (URLError,TimeoutError):raise FastAudioError('انتهت مهلة اتصال خدمة الصوت المباشر.') from None
@@ -279,6 +287,7 @@ class TunelioResolver(Resolver):
             if data.get('status')!='ok' or data.get('quality')!='m4a' or data.get('mode')!='audio' or type(size) is not int or not 0<size<=MAX_SOURCE or type(expires) is not int or expires<=time.time()+30:raise ValueError()
             if urlsplit(url).hostname!='tunelio.dev':raise ValueError()
         except (ValueError,TypeError,KeyError):raise FastAudioError('بيانات خدمة الصوت المباشر غير صالحة.') from None
+        print('Tunelio create validated: native AAC source ready',file=sys.stderr,flush=True)
         return {'url':url,'length':size,'headers':{},'expires':expires}
 
 def configured_resolver():

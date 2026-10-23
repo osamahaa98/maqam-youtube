@@ -1,4 +1,5 @@
 import concurrent.futures
+from contextlib import redirect_stderr
 import io
 import json
 import math
@@ -99,6 +100,14 @@ class Tests(unittest.TestCase):
                 with urllib.request.urlopen(req) as r:self.assertEqual(r.read(),b'RIFF-test');self.assertEqual(r.headers['X-Maqam-Source-Bytes'],'123');self.assertIn('total;dur=10',r.headers['Server-Timing'])
         finally:server.shutdown();server.server_close();t.join()
 class TunelioTests(unittest.TestCase):
+    def test_range_network_errors_are_actionable_without_signed_url_leaks(self):
+        for error in (urllib.error.HTTPError('https://tunelio.dev/tunnel?sig=private',403,'private',{},io.BytesIO(b'private')),TimeoutError('private')):
+            source=Remote('https://tunelio.dev/tunnel?sig=private',1234)
+            log=io.StringIO()
+            with patch.object(source.opener,'open',side_effect=error),redirect_stderr(log):
+                with self.assertRaises(FastAudioError) as caught:source.read(0,8)
+            self.assertNotIn('private',log.getvalue());self.assertNotIn('private',str(caught.exception))
+            self.assertEqual(source.bytes,0)
     def resolver(self,change=None,body=None):
         data={'status':'ok','quality':'m4a','mode':'audio','file_size':123456,'expires':int(time.time())+3600,'url':'https://tunelio.dev/tunnel?exp=123&sig=test'}
         data.update(change or {})
