@@ -9,6 +9,7 @@ import sys
 import tempfile
 import threading
 import traceback
+import wave
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -106,7 +107,11 @@ class NoRedirect(HTTPRedirectHandler):
 
 PROVIDER = 'https://save.brianrianrehan.com'
 
-def provider_request(path, payload, target=None):
+class ProviderFormatError(ValueError):
+    pass
+
+
+def provider_request(path, payload, target=None, media_type='audio/'):
     request = Request(PROVIDER + path, json.dumps(payload).encode(),
                       {'Content-Type': 'application/json', 'Accept': '*/*', 'User-Agent': 'MaqamYouTube/1.0'}, method='POST')
     try:
@@ -117,7 +122,7 @@ def provider_request(path, payload, target=None):
             length = response.headers.get('Content-Length')
             if length and int(length) > cap:
                 raise ValueError('الصوت أكبر من الحد المتاح؛ ارفع الجزء المطلوب كملف.')
-            if target and not response.headers.get('Content-Type', '').startswith('audio/'):
+            if target and not response.headers.get('Content-Type', '').lower().startswith(media_type):
                 raise ValueError('خدمة الجلب لم تُرجع ملف صوت صالحًا.')
             total = 0
             deadline = monotonic() + (100 if target else 25)
@@ -140,36 +145,75 @@ def provider_request(path, payload, target=None):
                 raise ValueError('خدمة الجلب أرجعت ملفًا فارغًا.')
             return None if target else json.loads(b''.join(chunks))
     except HTTPError as error:
+        if error.code == 422 and target and media_type == 'audio/':
+            raise ProviderFormatError('المزوّد ما قدر يجهّز الصوت لهذا الفيديو.') from None
         if error.code == 429:
             raise ValueError('خدمة الجلب وصلت حد الطلبات؛ جرّب لاحقًا أو ارفع الملف.') from None
         raise ValueError('خدمة جلب الصوت غير متاحة الآن؛ جرّب لاحقًا أو ارفع الملف.') from None
     except (URLError, TimeoutError):
         raise ValueError('تعذّر الاتصال بخدمة جلب الصوت؛ جرّب لاحقًا.') from None
 
+def fallback_video(meta):
+    for item in meta.get('formats') or ():
+        if not isinstance(item, dict):
+            continue
+        if (str(item.get('formatId')) == '18' and item.get('ext') == 'mp4'
+                and item.get('hasVideo') is True and item.get('hasAudio') is True):
+            size = item.get('filesize')
+            if not isinstance(size, (int, float)) or 0 < size <= LIMIT:
+                return {'format': 'video', 'quality': '360p', 'outputFormat': 'mp4',
+                        'formatId': '18', 'convert': False}
+    return None
+
+
 def import_audio(data):
     url, start, end = selection(data)
     info = provider_request('/api/v1/info', {'url': url})
     meta = info.get('data', {})
     duration = meta.get('durationSeconds')
-    if not info.get('success') or meta.get('isLive') or not isinstance(duration, (float, int)) or not math.isfinite(duration) or not 3 <= duration <= 1800 or end > duration:
-        raise ValueError('اختر فيديو متاحًا ومسجلًا حتى ٣٠ دقيقة، وفترة داخل مدته.')
+    if not info.get('success') or meta.get('isLive') or not isinstance(duration, (float, int)) or not math.isfinite(duration) or not 3 <= duration <= 1800:
+        raise ValueError('اختر فيديو متاحًا ومسجلًا حتى ٣٠ دقيقة.')
+    end = min(end, duration)
+    if end - start < 3:
+        raise ValueError('بداية الفترة خارج الصوت المتاح؛ اختر بداية أبكر.')
+    video = fallback_video(meta)
+    use_video = video and (data.get('preferVideo') is True or not any(
+        isinstance(item, dict) and item.get('hasAudio') is True and item.get('hasVideo') is False
+        for item in (meta.get('formats') or ())
+    ))
+    audio = {'format': 'audio', 'quality': 'best', 'outputFormat': 'mp3'}
+    download = '/api/v1/download?wait=true&download=true'
     with tempfile.TemporaryDirectory(prefix='maqam-youtube-') as folder:
-        source = Path(folder) / 'source.mp3'
-        provider_request('/api/v1/download?wait=true&download=true',
-                         {'url': url, 'format': 'audio', 'quality': 'best', 'outputFormat': 'mp3'}, source)
+        source = Path(folder) / 'source'
+        if not use_video:
+            try:
+                provider_request(download, {'url': url, **audio}, source)
+            except ProviderFormatError:
+                if not video:
+                    raise
+                use_video = True
+        if use_video:
+            provider_request(download, {'url': url, **video}, source, media_type='video/mp4')
         target = Path(folder) / 'clip.wav'
         trim(source, target, start, end)
-        return target.read_bytes()
+        with wave.open(str(target), 'rb') as wav:
+            seconds = wav.getnframes() / wav.getframerate()
+        if seconds < 3:
+            raise ValueError('بداية الفترة خارج الصوت المتاح؛ اختر بداية أبكر.')
+        return target.read_bytes(), seconds
+
 
 class Handler(BaseHTTPRequestHandler):
-    def reply(self, status, body, content_type='application/json; charset=utf-8', timings=None):
+    def reply(self, status, body, content_type='application/json; charset=utf-8', timings=None, clip_seconds=None):
         self.send_response(status)
         self.send_header('Content-Type', content_type)
         self.send_header('Content-Length', str(len(body)))
         self.send_header('Cache-Control', 'no-store')
         self.send_header('X-Content-Type-Options', 'nosniff')
         self.send_cors_headers()
-        self.send_header('Vary', 'Origin')
+        if clip_seconds is not None:
+            self.send_header('X-Maqam-Clip-Seconds', str(clip_seconds))
+            self.send_header('Access-Control-Expose-Headers', 'X-Maqam-Clip-Seconds')
         if timings is not None:
             self.send_header('X-Maqam-Cache', timings['cache'])
             self.send_header('X-Maqam-Source-Bytes', str(timings['sourceBytes']))
@@ -241,7 +285,8 @@ class Handler(BaseHTTPRequestHandler):
                 audio,timings=DIRECT_SERVICE.clip(video,start,end)
                 self.reply(200,audio,timings.get('contentType','audio/wav'),timings)
             else:
-                self.reply(200, import_audio(data), 'audio/wav')
+                audio, seconds = import_audio(data)
+                self.reply(200, audio, 'audio/wav', clip_seconds=seconds)
         except ValueError as e:
             self.error(422, str(e))
         except Exception as error:
