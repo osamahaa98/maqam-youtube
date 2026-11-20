@@ -18,7 +18,11 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlsplit
 from fast_audio import Service as DirectService
 
-ORIGIN = os.environ.get('SITE_ORIGIN', 'https://maqam-listener.soundtern.chatgpt.site')
+# Allow the current site and preserve the configured legacy origin.
+ORIGINS = tuple(dict.fromkeys((
+    'https://maqam-listener.osamah-htc.chatgpt.site',
+    os.environ.get('SITE_ORIGIN', 'https://maqam-listener.soundtern.chatgpt.site'),
+)))
 LIMIT = 40 * 1024 * 1024
 SLOTS = threading.BoundedSemaphore(2)
 RATE_LOCK = threading.Lock()
@@ -164,7 +168,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Content-Length', str(len(body)))
         self.send_header('Cache-Control', 'no-store')
         self.send_header('X-Content-Type-Options', 'nosniff')
-        self.send_header('Access-Control-Allow-Origin', ORIGIN)
+        self.send_cors_headers()
         self.send_header('Vary', 'Origin')
         if timings is not None:
             self.send_header('X-Maqam-Cache', timings['cache'])
@@ -175,14 +179,20 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_cors_headers(self):
+        self.send_header('Vary', 'Origin')
+        origin = self.headers.get('Origin')
+        if origin in ORIGINS:
+            self.send_header('Access-Control-Allow-Origin', origin)
+
     def error(self, status, message):
         self.reply(status, json.dumps({'error': message}, ensure_ascii=False).encode())
 
     def do_OPTIONS(self):
-        if self.headers.get('Origin') != ORIGIN:
+        if self.headers.get('Origin') not in ORIGINS:
             return self.error(403, 'Origin denied')
         self.send_response(204)
-        self.send_header('Access-Control-Allow-Origin', ORIGIN)
+        self.send_cors_headers()
         self.send_header('Access-Control-Allow-Methods', 'POST, OPTIONS')
         self.send_header('Access-Control-Allow-Headers', 'Content-Type')
         self.end_headers()
@@ -195,7 +205,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path not in ('/audio', '/clip'):
             return self.error(404, 'Not found')
-        if self.headers.get('Origin') != ORIGIN:
+        if self.headers.get('Origin') not in ORIGINS:
             return self.error(403, 'Origin denied')
         if self.path == '/clip' and not DIRECT_ENABLED:
             return self.error(503, 'المسار المباشر لم يُفعّل على هذا الخادم.')
