@@ -10,7 +10,9 @@ import tempfile
 import threading
 import traceback
 import wave
-from collections import deque
+from collections import OrderedDict, deque
+from concurrent.futures import Future
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from time import monotonic
@@ -106,8 +108,14 @@ class NoRedirect(HTTPRedirectHandler):
         return None
 
 PROVIDER = 'https://save.brianrianrehan.com'
+PROVIDER_DOWNLOAD = '/api/v1/download?wait=true&download=true'
+VIDEO_FORMAT_18 = {'format': 'video', 'quality': '360p', 'outputFormat': 'mp4',
+                   'formatId': '18', 'convert': False}
 
 class ProviderFormatError(ValueError):
+    pass
+
+class ProviderRateError(ValueError):
     pass
 
 
@@ -145,10 +153,10 @@ def provider_request(path, payload, target=None, media_type='audio/'):
                 raise ValueError('خدمة الجلب أرجعت ملفًا فارغًا.')
             return None if target else json.loads(b''.join(chunks))
     except HTTPError as error:
-        if error.code == 422 and target and media_type == 'audio/':
+        if error.code == 422 and target:
             raise ProviderFormatError('المزوّد ما قدر يجهّز الصوت لهذا الفيديو.') from None
         if error.code == 429:
-            raise ValueError('خدمة الجلب وصلت حد الطلبات؛ جرّب لاحقًا أو ارفع الملف.') from None
+            raise ProviderRateError('خدمة الجلب وصلت حد الطلبات؛ جرّب لاحقًا أو ارفع الملف.') from None
         raise ValueError('خدمة جلب الصوت غير متاحة الآن؛ جرّب لاحقًا أو ارفع الملف.') from None
     except (URLError, TimeoutError):
         raise ValueError('تعذّر الاتصال بخدمة جلب الصوت؛ جرّب لاحقًا.') from None
@@ -161,45 +169,155 @@ def fallback_video(meta):
                 and item.get('hasVideo') is True and item.get('hasAudio') is True):
             size = item.get('filesize')
             if not isinstance(size, (int, float)) or 0 < size <= LIMIT:
-                return {'format': 'video', 'quality': '360p', 'outputFormat': 'mp4',
-                        'formatId': '18', 'convert': False}
+                return VIDEO_FORMAT_18
     return None
 
 
-def import_audio(data):
-    url, start, end = selection(data)
-    info = provider_request('/api/v1/info', {'url': url})
-    meta = info.get('data', {})
-    duration = meta.get('durationSeconds')
-    if not info.get('success') or meta.get('isLive') or not isinstance(duration, (float, int)) or not math.isfinite(duration) or not 3 <= duration <= 1800:
+@dataclass(frozen=True)
+class AudioSource:
+    body: bytes
+    duration: float
+
+
+class AudioSourceCache:
+    """Short-lived in-process media cache. HTTP requests already hold a work slot."""
+    def __init__(self, max_bytes=56 * 1024 * 1024, max_entries=4, ttl=300, clock=monotonic):
+        self.max_bytes, self.max_entries, self.ttl, self.clock = max_bytes, max_entries, ttl, clock
+        self.lock = threading.Lock()
+        self.entries = OrderedDict()
+        self.inflight = {}
+        self.bytes = 0
+
+    def _remove(self, url):
+        self.bytes -= len(self.entries.pop(url)[1].body)
+
+    def get(self, url, fetch):
+        with self.lock:
+            now = self.clock()
+            for key, (expires, _) in list(self.entries.items()):
+                if expires <= now:
+                    self._remove(key)
+            if url in self.entries:
+                self.entries.move_to_end(url)
+                return self.entries[url][1], 'hit'
+            pending = self.inflight.get(url)
+            owner = pending is None
+            if owner:
+                pending = self.inflight[url] = Future()
+        if not owner:
+            return pending.result(), 'shared'
+        try:
+            source = fetch()
+            with self.lock:
+                size = len(source.body)
+                if size <= self.max_bytes:
+                    while self.entries and (self.bytes + size > self.max_bytes or len(self.entries) >= self.max_entries):
+                        self._remove(next(iter(self.entries)))
+                    self.entries[url] = (self.clock() + self.ttl, source)
+                    self.bytes += size
+                pending.set_result(source)
+            return source, 'miss'
+        except BaseException as error:
+            pending.set_exception(error)
+            raise
+        finally:
+            with self.lock:
+                self.inflight.pop(url, None)
+
+
+AUDIO_SOURCES = AudioSourceCache()
+
+
+def media_duration(source):
+    data = json.loads(run(['ffprobe', '-v', 'error', '-protocol_whitelist', 'file,pipe',
+                           '-select_streams', 'a:0', '-show_entries', 'format=duration:stream=index',
+                           '-of', 'json', str(source)], 8))
+    try:
+        duration = float(data['format']['duration'])
+    except (KeyError, TypeError, ValueError):
+        duration = math.nan
+    # Allow the container's sub-second padding at the 30-minute ceiling.
+    if not data.get('streams') or not 3 <= duration <= 1800.5:
         raise ValueError('اختر فيديو متاحًا ومسجلًا حتى ٣٠ دقيقة.')
-    end = min(end, duration)
-    if end - start < 3:
-        raise ValueError('بداية الفترة خارج الصوت المتاح؛ اختر بداية أبكر.')
-    video = fallback_video(meta)
-    use_video = video and (data.get('preferVideo') is True or not any(
+    return min(duration, 1800)
+
+
+def provider_metadata(url):
+    info = provider_request('/api/v1/info', {'url': url})
+    meta = info.get('data')
+    duration = meta.get('durationSeconds') if isinstance(meta, dict) else None
+    if not info.get('success') or not isinstance(duration, (float, int)) or meta.get('isLive') or not 3 <= duration <= 1800:
+        raise ValueError('اختر فيديو متاحًا ومسجلًا حتى ٣٠ دقيقة.')
+    formats = meta.get('formats')
+    has_audio_only = isinstance(formats, list) and any(
         isinstance(item, dict) and item.get('hasAudio') is True and item.get('hasVideo') is False
-        for item in (meta.get('formats') or ())
-    ))
+        for item in formats
+    )
+    return duration, fallback_video(meta) if isinstance(formats, list) else None, has_audio_only
+
+
+def download_source(url, prefer_video, video_format_18, timings):
+    def download(target, payload, media_type='audio/'):
+        started = monotonic()
+        try:
+            provider_request(PROVIDER_DOWNLOAD, {'url': url, **payload}, target, media_type=media_type)
+        finally:
+            timings['transferMs'] = timings.get('transferMs', 0) + round((monotonic() - started) * 1000)
+
     audio = {'format': 'audio', 'quality': 'best', 'outputFormat': 'mp3'}
-    download = '/api/v1/download?wait=true&download=true'
     with tempfile.TemporaryDirectory(prefix='maqam-youtube-') as folder:
         source = Path(folder) / 'source'
-        if not use_video:
+        bad_hinted_format = None
+        if video_format_18:
             try:
-                provider_request(download, {'url': url, **audio}, source)
-            except ProviderFormatError:
-                if not video:
-                    raise
-                use_video = True
-        if use_video:
-            provider_request(download, {'url': url, **video}, source, media_type='video/mp4')
+                # The client can choose a fixed provider format. It cannot supply its
+                # URL, size or duration. Verify the downloaded media before caching it.
+                download(source, VIDEO_FORMAT_18, 'video/mp4')
+            except ProviderFormatError as error:
+                bad_hinted_format = error
+        if not video_format_18 or bad_hinted_format:
+            started = monotonic()
+            _, video, has_audio_only = provider_metadata(url)
+            timings['metadataMs'] = round((monotonic() - started) * 1000)
+            if bad_hinted_format and not has_audio_only:
+                raise bad_hinted_format
+            if not bad_hinted_format and video and (prefer_video or not has_audio_only):
+                download(source, video, 'video/mp4')
+            else:
+                try:
+                    download(source, audio)
+                except ProviderFormatError:
+                    if bad_hinted_format or not video:
+                        raise
+                    download(source, video, 'video/mp4')
+        started = monotonic()
+        duration = media_duration(source)
+        timings['probeMs'] = round((monotonic() - started) * 1000)
+        return AudioSource(source.read_bytes(), duration)
+
+
+def import_audio(data, timings=None):
+    started = monotonic()
+    timings = {} if timings is None else timings
+    url, start, end = selection(data)
+    source, cache = AUDIO_SOURCES.get(url, lambda: download_source(
+        url, data.get('preferVideo') is True, data.get('videoFormat18') is True, timings))
+    end = min(end, source.duration)
+    if end - start < 3:
+        raise ValueError('بداية الفترة خارج الصوت المتاح؛ اختر بداية أبكر.')
+    trim_started = monotonic()
+    with tempfile.TemporaryDirectory(prefix='maqam-youtube-') as folder:
+        media = Path(folder) / 'source'
+        media.write_bytes(source.body)
         target = Path(folder) / 'clip.wav'
-        trim(source, target, start, end)
+        trim(media, target, start, end)
         with wave.open(str(target), 'rb') as wav:
             seconds = wav.getnframes() / wav.getframerate()
         if seconds < 3:
             raise ValueError('بداية الفترة خارج الصوت المتاح؛ اختر بداية أبكر.')
+        timings.update(cache=cache, sourceBytes=len(source.body) if cache == 'miss' else 0,
+                       trimMs=round((monotonic() - trim_started) * 1000),
+                       totalMs=round((monotonic() - started) * 1000), clipSeconds=seconds)
         return target.read_bytes(), seconds
 
 
@@ -211,7 +329,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Cache-Control', 'no-store')
         self.send_header('X-Content-Type-Options', 'nosniff')
         self.send_cors_headers()
-        if clip_seconds is not None:
+        if clip_seconds is not None and timings is None:
             self.send_header('X-Maqam-Clip-Seconds', str(clip_seconds))
             self.send_header('Access-Control-Expose-Headers', 'X-Maqam-Clip-Seconds')
         if timings is not None:
@@ -285,8 +403,11 @@ class Handler(BaseHTTPRequestHandler):
                 audio,timings=DIRECT_SERVICE.clip(video,start,end)
                 self.reply(200,audio,timings.get('contentType','audio/wav'),timings)
             else:
-                audio, seconds = import_audio(data)
-                self.reply(200, audio, 'audio/wav', clip_seconds=seconds)
+                timings = {}
+                audio, seconds = import_audio(data, timings)
+                self.reply(200, audio, 'audio/wav', timings=timings or None, clip_seconds=seconds)
+        except ProviderRateError as e:
+            self.error(429, str(e))
         except ValueError as e:
             self.error(422, str(e))
         except Exception as error:
